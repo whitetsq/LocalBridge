@@ -475,6 +475,32 @@ export class BrowserFsWorkspace {
     return { deleted: splitCleanPath(relPath).join('/') };
   }
 
+  async createDirectory(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const relPath = String(args.path || '');
+    const parts = splitCleanPath(relPath);
+    if (parts.length === 0) throw new Error('目录路径不能为空');
+    await resolveBrowserDir(this.root, parts.join('/'), true);
+    return { created: parts.join('/') };
+  }
+
+  async movePath(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const from = String(args.from || '');
+    const to = String(args.to || '');
+    if (!from || !to) throw new Error('缺少参数 from 或 to');
+    // Copy file to destination and delete source in browser File System Access mode
+    const srcHandle = await resolveBrowserFile(this.root, from, false);
+    const content = await (await srcHandle.getFile()).text();
+    const dstHandle = await resolveBrowserFile(this.root, to, true);
+    const writable = await dstHandle.createWritable();
+    await writable.write(content);
+    await writable.close();
+    await this.deleteFile({ path: from });
+    return {
+      from: splitCleanPath(from).join('/'),
+      to: splitCleanPath(to).join('/'),
+    };
+  }
+
   async executeTool(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     switch (name) {
       case 'inspect_workspace':
@@ -491,6 +517,10 @@ export class BrowserFsWorkspace {
         return this.writeFile(args);
       case 'delete_file':
         return this.deleteFile(args);
+      case 'create_directory':
+        return this.createDirectory(args);
+      case 'move_path':
+        return this.movePath(args);
       case 'git_diff': {
         const list = this.getSessionDiffs();
         return {

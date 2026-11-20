@@ -180,6 +180,38 @@ function buildToolDeclarations(allowWrite: boolean, allowShell: boolean): Functi
         required: ['path'],
       },
     },
+    {
+      name: 'create_directory',
+      description: '在工作区内创建新文件夹（自动递归创建缺失的父目录）。',
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          path: {
+            type: Type.STRING,
+            description: '要新建的相对目录路径，例如 "src/utils" 或 "docs/archive"',
+          },
+        },
+        required: ['path'],
+      },
+    },
+    {
+      name: 'move_path',
+      description: '在工作区内移动或重命名文件/文件夹（例如整理目录结构、文件归档或重命名）。',
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          from: {
+            type: Type.STRING,
+            description: '源相对路径',
+          },
+          to: {
+            type: Type.STRING,
+            description: '目标相对路径',
+          },
+        },
+        required: ['from', 'to'],
+      },
+    },
   ];
 
   const shellTools: FunctionDeclaration[] = [

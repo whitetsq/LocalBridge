@@ -13,6 +13,8 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
 
   const isCommand = approval.toolName === 'run_command';
   const isDelete = approval.toolName === 'delete_file';
+  const isCreateDir = approval.toolName === 'create_directory';
+  const isMove = approval.toolName === 'move_path';
   const suggestedPrefix =
     isCommand && approval.command ? suggestAllowlistPrefix(approval.command) : undefined;
 
@@ -20,9 +22,13 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
     ? '请求执行本机终端命令'
     : isDelete
       ? '请求删除本地文件'
-      : approval.toolName === 'write_file'
-        ? '请求写入本地文件'
-        : '请求修改本地文件';
+      : isCreateDir
+        ? '请求新建本地文件夹'
+        : isMove
+          ? '请求移动 / 重命名路径'
+          : approval.toolName === 'write_file'
+            ? '请求写入本地文件'
+            : '请求修改本地文件';
 
   return (
     <div className="my-3 rounded-xl border border-amber-300/80 dark:border-amber-700/60 bg-amber-50/40 dark:bg-amber-950/15 overflow-hidden">
@@ -60,6 +66,19 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
                 cwd: {String(approval.args.cwd)}
               </div>
             )}
+          </div>
+        )}
+
+        {isMove && (
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B0F17] font-mono text-xs text-slate-800 dark:text-slate-200 space-y-1">
+            <div>源路径：{String(approval.args.from || '')}</div>
+            <div>目标路径：{String(approval.args.to || '')}</div>
+          </div>
+        )}
+
+        {isCreateDir && approval.filePath && (
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B0F17] font-mono text-xs text-slate-800 dark:text-slate-200">
+            新建目录：{approval.filePath}
           </div>
         )}
 

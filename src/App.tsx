@@ -103,6 +103,10 @@ function formatToolLabel(name: string, args: Record<string, unknown>): string {
       return `write_file(${String(args.path || '')})`;
     case 'delete_file':
       return `delete_file(${String(args.path || '')})`;
+    case 'create_directory':
+      return `create_directory(${String(args.path || '')})`;
+    case 'move_path':
+      return `move_path(${String(args.from || '')} -> ${String(args.to || '')})`;
     case 'git_diff':
       return `git_diff(${args.path ? String(args.path) : 'repo'})`;
     case 'run_command':
@@ -606,8 +610,19 @@ export default function App() {
         } else if (policy === 'allowlist') {
           needsApproval = !isCommandAllowlisted(cmd, allowlistRef.current);
         }
-      } else if (name === 'edit_file' || name === 'write_file' || name === 'delete_file') {
-        needsApproval = !(policy === 'allowlist' && autoWritesRef.current && name !== 'delete_file');
+      } else if (
+        name === 'edit_file' ||
+        name === 'write_file' ||
+        name === 'delete_file' ||
+        name === 'create_directory' ||
+        name === 'move_path'
+      ) {
+        needsApproval = !(
+          policy === 'allowlist' &&
+          autoWritesRef.current &&
+          name !== 'delete_file' &&
+          name !== 'move_path'
+        );
       }
 
       if (needsApproval) {
@@ -622,8 +637,12 @@ export default function App() {
           turnId,
           toolName: name,
           args,
-          reason: name === 'run_command' ? '命令执行审批' : '文件改动审批',
-          filePath: args.path ? String(args.path) : undefined,
+          reason: name === 'run_command' ? '命令执行审批' : '文件与目录操作审批',
+          filePath: args.path
+            ? String(args.path)
+            : args.from
+              ? `${String(args.from)} → ${String(args.to || '')}`
+              : undefined,
           command: args.command ? String(args.command) : undefined,
           ...preview,
         });
@@ -715,10 +734,16 @@ export default function App() {
           );
         }
 
-        // Refresh UI state when files change
-        if (name === 'edit_file' || name === 'write_file' || name === 'delete_file') {
+        // Refresh UI state when files or folders change
+        if (
+          name === 'edit_file' ||
+          name === 'write_file' ||
+          name === 'delete_file' ||
+          name === 'create_directory' ||
+          name === 'move_path'
+        ) {
           refreshDiff();
-          if (name === 'write_file' || name === 'delete_file') {
+          if (name !== 'edit_file') {
             refreshFileTree();
           }
           if (args.path && openFile?.path === String(args.path) && name !== 'delete_file') {

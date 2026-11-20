@@ -65,13 +65,13 @@ export function BridgeSetupView({
 
   const startCmd =
     osTab === 'unix'
-      ? 'cd /path/to/your-project\nnode ~/Downloads/local-bridge.mjs'
-      : 'cd C:\\path\\to\\your-project\nnode %USERPROFILE%\\Downloads\\local-bridge.mjs';
+      ? 'cd /path/to/your-project\nnode ~/Downloads/local-bridge.mjs setup'
+      : 'cd C:\\path\\to\\your-project\nnode %USERPROFILE%\\Downloads\\local-bridge.mjs setup';
 
   const safeStartCmd =
     osTab === 'unix'
-      ? 'node ~/Downloads/local-bridge.mjs --no-shell --port 4829'
-      : 'node %USERPROFILE%\\Downloads\\local-bridge.mjs --no-shell --port 4829';
+      ? 'node ~/Downloads/local-bridge.mjs --read-only --port 4829'
+      : 'node %USERPROFILE%\\Downloads\\local-bridge.mjs --read-only --port 4829';
 
   const mcpTunnelSnippet = `# 可选：如需接入 ChatGPT 开发者模式等外部云端 MCP 客户端
 cloudflared tunnel --url http://127.0.0.1:4829

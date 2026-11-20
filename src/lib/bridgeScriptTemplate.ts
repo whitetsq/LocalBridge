@@ -5,8 +5,9 @@ export function getLocalBridgeScript(): string {
  * Node.js v20+ required. Binds strictly to 127.0.0.1.
  *
  * Usage:
- *   node local-bridge.mjs
- *   node local-bridge.mjs --port 4829 --root . --no-shell
+ *   node local-bridge.mjs                  # Start immediately with current folder
+ *   node local-bridge.mjs setup            # Interactive CLI permission & port wizard
+ *   node local-bridge.mjs --port 4829 --root . --no-shell --read-only
  */
 
 import http from 'node:http';
@@ -15,6 +16,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 
 const args = process.argv.slice(2);
 function getFlag(name, fallback) {
@@ -25,11 +28,48 @@ function getFlag(name, fallback) {
   return fallback;
 }
 
-const PORT = Number(getFlag('--port', process.env.LOCALBRIDGE_PORT || '4829'));
-const ROOT_INPUT = getFlag('--root', process.cwd());
+const IS_INTERACTIVE_SETUP = args.includes('setup') || args.includes('--setup');
+
+let PORT = Number(getFlag('--port', process.env.LOCALBRIDGE_PORT || '4829'));
+let ROOT_INPUT = getFlag('--root', process.cwd());
+let READ_ONLY = args.includes('--read-only') || process.env.LOCALBRIDGE_READ_ONLY === '1';
+let NO_SHELL = READ_ONLY || args.includes('--no-shell') || process.env.LOCALBRIDGE_NO_SHELL === '1';
+let TOKEN = getFlag('--token', process.env.LOCALBRIDGE_TOKEN || crypto.randomBytes(20).toString('hex'));
+
+if (IS_INTERACTIVE_SETUP) {
+  const rl = readline.createInterface({ input, output });
+  try {
+    console.log('');
+    console.log('=== LocalBridge 交互式权限配置向导 ===');
+    const dirAns = (await rl.question(\`1) 授权工作区目录 [默认当前目录 \${process.cwd()}]: \`)).trim();
+    if (dirAns) ROOT_INPUT = dirAns;
+
+    console.log('2) 请选择本机权限级别:');
+    console.log('   [1] 只读模式 (仅允许读取/搜索/git diff，禁止写文件和执行命令)');
+    console.log('   [2] 读写无命令模式 (允许读写改代码，禁止执行任何终端命令)');
+    console.log('   [3] 完整模式 (允许读写与终端命令，执行前由前端审批或白名单控制)');
+    const permAns = (await rl.question('   请输入选项编号 [默认 3]: ')).trim();
+    if (permAns === '1') {
+      READ_ONLY = true;
+      NO_SHELL = true;
+    } else if (permAns === '2') {
+      READ_ONLY = false;
+      NO_SHELL = true;
+    } else {
+      READ_ONLY = false;
+      NO_SHELL = false;
+    }
+
+    const portAns = (await rl.question(\`3) 监听端口 (仅 127.0.0.1) [默认 \${PORT}]: \`)).trim();
+    if (portAns && !Number.isNaN(Number(portAns))) {
+      PORT = Number(portAns);
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 const ROOT = fs.realpathSync(path.resolve(ROOT_INPUT));
-const NO_SHELL = args.includes('--no-shell') || process.env.LOCALBRIDGE_NO_SHELL === '1';
-const TOKEN = getFlag('--token', process.env.LOCALBRIDGE_TOKEN || crypto.randomBytes(20).toString('hex'));
 
 const IGNORED_DIRS = new Set([
   'node_modules',
@@ -329,6 +369,7 @@ async function searchFilesTool({ query, dir = '.', maxResults = 60 }) {
 }
 
 async function editFileTool({ path: relPath, oldString, newString, replaceAll = false }) {
+  if (READ_ONLY) throw new Error('本机 Bridge 已以 --read-only 只读模式启动，拒绝修改文件');
   if (!relPath) throw new Error('缺少参数: path');
   if (typeof oldString !== 'string' || oldString.length === 0) {
     throw new Error('oldString 不能为空');
@@ -354,6 +395,7 @@ async function editFileTool({ path: relPath, oldString, newString, replaceAll = 
 }
 
 async function writeFileTool({ path: relPath, content }) {
+  if (READ_ONLY) throw new Error('本机 Bridge 已以 --read-only 只读模式启动，拒绝写入文件');
   if (!relPath) throw new Error('缺少参数: path');
   if (typeof content !== 'string') throw new Error('缺少参数: content');
   const full = await resolveSafePath(relPath, { mustExist: false });
@@ -367,6 +409,7 @@ async function writeFileTool({ path: relPath, content }) {
 }
 
 async function deleteFileTool({ path: relPath }) {
+  if (READ_ONLY) throw new Error('本机 Bridge 已以 --read-only 只读模式启动，拒绝删除文件');
   if (!relPath) throw new Error('缺少参数: path');
   const full = await resolveSafePath(relPath, { mustExist: true });
   const stat = await fsp.stat(full);
@@ -375,6 +418,28 @@ async function deleteFileTool({ path: relPath }) {
   }
   await fsp.unlink(full);
   return { deleted: normalizeRel(path.relative(ROOT, full)) };
+}
+
+async function createDirectoryTool({ path: relPath }) {
+  if (READ_ONLY) throw new Error('本机 Bridge 已以 --read-only 只读模式启动，拒绝新建目录');
+  if (!relPath) throw new Error('缺少参数: path');
+  const full = await resolveSafePath(relPath, { mustExist: false });
+  await fsp.mkdir(full, { recursive: true });
+  return { created: normalizeRel(path.relative(ROOT, full)) };
+}
+
+async function movePathTool({ from, to }) {
+  if (READ_ONLY) throw new Error('本机 Bridge 已以 --read-only 只读模式启动，拒绝移动或重命名路径');
+  if (!from || !to) throw new Error('缺少参数: from 或 to');
+  const src = await resolveSafePath(from, { mustExist: true });
+  const dst = await resolveSafePath(to, { mustExist: false });
+  if (src === ROOT) throw new Error('不能移动工作区根目录本身');
+  await fsp.mkdir(path.dirname(dst), { recursive: true });
+  await fsp.rename(src, dst);
+  return {
+    from: normalizeRel(path.relative(ROOT, src)),
+    to: normalizeRel(path.relative(ROOT, dst)),
+  };
 }
 
 async function gitDiffTool({ path: relPath, staged = false } = {}) {
@@ -485,6 +550,8 @@ const TOOL_HANDLERS = {
   edit_file: (a) => editFileTool(a || {}),
   write_file: (a) => writeFileTool(a || {}),
   delete_file: (a) => deleteFileTool(a || {}),
+  create_directory: (a) => createDirectoryTool(a || {}),
+  move_path: (a) => movePathTool(a || {}),
   git_diff: (a) => gitDiffTool(a || {}),
   run_command: (a) => runCommandTool(a || {}),
 };
@@ -529,38 +596,63 @@ const MCP_TOOLS_MANIFEST = [
       required: ['query'],
     },
   },
-  {
-    name: 'edit_file',
-    description: 'Replace an exact unique substring in an existing file.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        oldString: { type: 'string' },
-        newString: { type: 'string' },
-        replaceAll: { type: 'boolean' },
-      },
-      required: ['path', 'oldString', 'newString'],
-    },
-  },
-  {
-    name: 'write_file',
-    description: 'Create or overwrite a file inside the workspace.',
-    inputSchema: {
-      type: 'object',
-      properties: { path: { type: 'string' }, content: { type: 'string' } },
-      required: ['path', 'content'],
-    },
-  },
-  {
-    name: 'delete_file',
-    description: 'Delete a single file inside the workspace.',
-    inputSchema: {
-      type: 'object',
-      properties: { path: { type: 'string' } },
-      required: ['path'],
-    },
-  },
+  ...(READ_ONLY
+    ? []
+    : [
+        {
+          name: 'edit_file',
+          description: 'Replace an exact unique substring in an existing file.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              oldString: { type: 'string' },
+              newString: { type: 'string' },
+              replaceAll: { type: 'boolean' },
+            },
+            required: ['path', 'oldString', 'newString'],
+          },
+        },
+        {
+          name: 'write_file',
+          description: 'Create or overwrite a file inside the workspace.',
+          inputSchema: {
+            type: 'object',
+            properties: { path: { type: 'string' }, content: { type: 'string' } },
+            required: ['path', 'content'],
+          },
+        },
+        {
+          name: 'delete_file',
+          description: 'Delete a single file inside the workspace.',
+          inputSchema: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        },
+        {
+          name: 'create_directory',
+          description: 'Create a directory (and missing parent directories) inside the workspace.',
+          inputSchema: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        },
+        {
+          name: 'move_path',
+          description: 'Move or rename a file or directory inside the workspace.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              from: { type: 'string' },
+              to: { type: 'string' },
+            },
+            required: ['from', 'to'],
+          },
+        },
+      ]),
   {
     name: 'git_diff',
     description: 'Return git status and git diff for the repository or a specific file.',
@@ -664,6 +756,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       bridge: 'localbridge',
       version: '1.0.0',
+      readOnly: READ_ONLY,
       noShell: NO_SHELL,
     });
   }
@@ -802,7 +895,7 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(\`  工作区目录 : \${ROOT}\`);
   console.log(\`  本机地址   : http://127.0.0.1:\${PORT}\`);
   console.log(\`  安全 Token : \${TOKEN}\`);
-  console.log(\`  Shell 状态 : \${NO_SHELL ? '已禁用 (--no-shell)' : '已启用 (由前端审批策略控制)'}\`);
+  console.log(\`  权限模式   : \${READ_ONLY ? '只读模式 (--read-only)' : NO_SHELL ? '读写禁命令 (--no-shell)' : '完整模式 (由前端审批/白名单控制)'}\`);
   console.log(\`  MCP 端点   : http://127.0.0.1:\${PORT}/mcp\`);
   console.log('------------------------------------------------------------');
   console.log('  提示: 请将上方地址和 Token 复制到浏览器 LocalBridge 控制台连接。');
