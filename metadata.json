@@ -1,0 +1,8 @@
+{
+  "name": "LocalBridge",
+  "description": "本地仓库 MCP 桥接与 AI 编程代理控制台，支持 Chrome 直连本机目录读写、代码 Diff 审批与终端命令调用。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
