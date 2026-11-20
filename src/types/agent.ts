@@ -1,27 +1,65 @@
 export type SecurityPolicy = 'approve' | 'allowlist' | 'readonly';
 
-export type ConnectionMode = 'disconnected' | 'bridge' | 'browser-fs';
+export type MainView = 'companion' | 'code' | 'terminal';
 
-export type ReasoningLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+export type InspectorTab = 'file' | 'diff';
 
-export type MainView = 'workbench' | 'code' | 'terminal' | 'setup';
-
-export type InspectorTab = 'file' | 'diff' | 'commands';
-
-export interface BridgeConfig {
-  url: string;
-  token: string;
+export interface GitRepoSummary {
+  path: string;
+  name: string;
+  branch?: string;
+  dirtyCount?: number;
 }
 
-export interface WorkspaceSummary {
+export interface CompanionWorkspaceInfo {
   name: string;
   rootPath: string;
-  mode: ConnectionMode;
   noShell: boolean;
+  readOnly: boolean;
+  version?: string;
   branch?: string;
   dirtyCount?: number;
   stack?: string[];
-  scripts?: Record<string, string>;
+  gitRepos?: GitRepoSummary[];
+}
+
+export interface CompanionEventItem {
+  id: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  status: 'pending_approval' | 'running' | 'success' | 'error' | 'rejected';
+  source: 'companion-chat' | 'ui';
+  startedAt: number;
+  durationMs?: number;
+  result?: Record<string, unknown>;
+  error?: string;
+  previewBefore?: string;
+  previewAfter?: string;
+  filePath?: string;
+  command?: string;
+}
+
+export interface CompanionPendingApprovalItem {
+  id: string;
+  eventId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  filePath?: string;
+  command?: string;
+  previewBefore?: string;
+  previewAfter?: string;
+  createdAt: number;
+}
+
+export interface CompanionPublicState {
+  connected: boolean;
+  tunnelUrl: string;
+  workspace: CompanionWorkspaceInfo | null;
+  policy: SecurityPolicy;
+  autoApproveFileWrites: boolean;
+  allowlist: string[];
+  events: CompanionEventItem[];
+  pendingApprovals: CompanionPendingApprovalItem[];
 }
 
 export interface FileNode {
@@ -53,50 +91,7 @@ export interface CommandRecord {
   stderr: string;
   durationMs?: number;
   startedAt: number;
-  source: 'agent' | 'manual';
-}
-
-export interface GeminiPart {
-  text?: string;
-  thought?: boolean;
-  thoughtSignature?: string;
-  functionCall?: {
-    id?: string;
-    name: string;
-    args?: Record<string, unknown>;
-  };
-  functionResponse?: {
-    id?: string;
-    name: string;
-    response: Record<string, unknown>;
-  };
-}
-
-export interface GeminiContent {
-  role: 'user' | 'model';
-  parts: GeminiPart[];
-}
-
-export interface ToolExecutionTrace {
-  id: string;
-  callId?: string;
-  name: string;
-  args: Record<string, unknown>;
-  status: 'pending_approval' | 'running' | 'success' | 'error' | 'rejected';
-  result?: Record<string, unknown>;
-  error?: string;
-  durationMs?: number;
-  previewBefore?: string;
-  previewAfter?: string;
-}
-
-export interface ChatTurn {
-  id: string;
-  role: 'user' | 'assistant' | 'system';
-  text: string;
-  timestamp: number;
-  tools?: ToolExecutionTrace[];
-  error?: string;
+  source: 'companion' | 'manual';
 }
 
 export interface PendingApproval {
@@ -114,11 +109,4 @@ export interface PendingApproval {
     note?: string;
     addAllowlistPrefix?: string;
   }) => void;
-}
-
-export interface SessionDiffEntry {
-  path: string;
-  before: string;
-  after: string;
-  updatedAt: number;
 }

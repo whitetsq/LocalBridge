@@ -1,31 +1,35 @@
-import { Check, Copy, FileCode2, GitCompare, MessageSquarePlus, RefreshCw } from 'lucide-react';
+import { Check, Copy, FileCode2, GitBranch, GitCompare, RefreshCw } from 'lucide-react';
 import { useState } from 'react';
 import { DiffViewer } from './DiffViewer';
-import type { ConnectionMode, OpenFileState, SessionDiffEntry } from '../types/agent';
+import type { GitRepoSummary, OpenFileState } from '../types/agent';
 
 interface CodeInspectorPanelProps {
   mode: 'file' | 'diff';
-  connectionMode: ConnectionMode;
+  connected: boolean;
   openFile: OpenFileState | null;
+  gitRepos: GitRepoSummary[];
+  selectedGitRepo: string;
+  onSelectGitRepo: (repoPath: string) => void;
   gitDiffText: string;
   gitStatusText: string;
+  gitLogText: string;
   diffLoading: boolean;
-  sessionDiffs: SessionDiffEntry[];
   onRefreshDiff: () => Promise<void>;
-  onAskAboutFile: (filePath: string) => void;
   fullHeight?: boolean;
 }
 
 export function CodeInspectorPanel({
   mode,
-  connectionMode,
+  connected,
   openFile,
+  gitRepos,
+  selectedGitRepo,
+  onSelectGitRepo,
   gitDiffText,
   gitStatusText,
+  gitLogText,
   diffLoading,
-  sessionDiffs,
   onRefreshDiff,
-  onAskAboutFile,
   fullHeight = false,
 }: CodeInspectorPanelProps) {
   const [copied, setCopied] = useState(false);
@@ -40,17 +44,30 @@ export function CodeInspectorPanel({
   if (mode === 'diff') {
     return (
       <div className="h-full flex flex-col min-h-0">
-        <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
           <div className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 min-w-0">
             <GitCompare className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-            <span className="font-medium truncate">
-              {connectionMode === 'bridge' ? 'Git 工作区变更' : '本次会话文件改动'}
-            </span>
+            <span className="font-medium truncate">Git 仓库变更</span>
+            {gitRepos.length > 0 && (
+              <select
+                value={selectedGitRepo}
+                onChange={(e) => onSelectGitRepo(e.target.value)}
+                aria-label="选择 Git 子仓库"
+                className="ml-1 px-2 py-0.5 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-[#0B0F17] text-[11.5px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500 cursor-pointer"
+              >
+                {gitRepos.map((repo) => (
+                  <option key={repo.path} value={repo.path}>
+                    {repo.path === '.' ? repo.name : repo.path}
+                    {repo.branch ? ` (${repo.branch})` : ''}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
           <button
             type="button"
             onClick={onRefreshDiff}
-            disabled={connectionMode === 'disconnected' || diffLoading}
+            disabled={!connected || diffLoading}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${diffLoading ? 'animate-spin' : ''}`} />
@@ -59,49 +76,42 @@ export function CodeInspectorPanel({
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {connectionMode === 'disconnected' ? (
+          {!connected ? (
             <div className="py-12 text-center text-xs text-slate-500 dark:text-slate-400">
-              连接本地仓库后，可在此实时审查 Git Diff 或文件修改记录。
+              绑定本机隧道后，可在此实时审查多仓库 Git 状态、未提交 Diff 与最近提交记录。
             </div>
-          ) : connectionMode === 'bridge' ? (
+          ) : (
             <>
               {gitStatusText && (
                 <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] font-mono text-[11.5px] text-slate-700 dark:text-slate-300 whitespace-pre-wrap">
                   {gitStatusText}
                 </div>
               )}
+
               <DiffViewer
                 rawGitDiff={gitDiffText}
-                maxHeightClass={fullHeight ? 'max-h-[70vh]' : 'max-h-[55vh]'}
-                emptyLabel="工作区暂无未提交的 Git Diff 改动"
+                maxHeightClass={fullHeight ? 'max-h-[55vh]' : 'max-h-[45vh]'}
+                emptyLabel="当前仓库暂无未提交的 Git Diff 改动"
               />
-            </>
-          ) : sessionDiffs.length === 0 ? (
-            <div className="py-12 text-center text-xs text-slate-500 dark:text-slate-400">
-              本次会话尚未修改任何本地文件。
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {sessionDiffs.map((entry) => (
-                <div key={entry.path} className="space-y-1.5">
-                  <div className="text-xs font-mono font-medium text-slate-800 dark:text-slate-200">
-                    {entry.path}
+
+              {gitLogText && (
+                <div className="space-y-1.5 pt-2">
+                  <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-slate-500 dark:text-slate-400">
+                    <GitBranch className="w-3.5 h-3.5" />
+                    <span>最近提交</span>
                   </div>
-                  <DiffViewer
-                    before={entry.before}
-                    after={entry.after}
-                    maxHeightClass={fullHeight ? 'max-h-[55vh]' : 'max-h-[320px]'}
-                  />
+                  <pre className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] font-mono text-[11.5px] leading-relaxed text-slate-700 dark:text-slate-300 overflow-x-auto whitespace-pre">
+                    {gitLogText}
+                  </pre>
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
       </div>
     );
   }
 
-  // File Preview mode
   return (
     <div className="h-full flex flex-col min-h-0">
       <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
@@ -121,29 +131,18 @@ export function CodeInspectorPanel({
         </div>
 
         {openFile && !openFile.loading && !openFile.error && (
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              type="button"
-              onClick={() => onAskAboutFile(openFile.path)}
-              title="让 AI 分析当前打开的文件"
-              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <MessageSquarePlus className="w-3.5 h-3.5" />
-              <span>询问 AI</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleCopyFile}
-              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              {copied ? (
-                <Check className="w-3.5 h-3.5 text-emerald-500" />
-              ) : (
-                <Copy className="w-3.5 h-3.5" />
-              )}
-              <span>{copied ? '已复制' : '复制'}</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={handleCopyFile}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            {copied ? (
+              <Check className="w-3.5 h-3.5 text-emerald-500" />
+            ) : (
+              <Copy className="w-3.5 h-3.5" />
+            )}
+            <span>{copied ? '已复制' : '复制'}</span>
+          </button>
         )}
       </div>
 
@@ -154,7 +153,7 @@ export function CodeInspectorPanel({
               从左侧目录树点击文件即可预览源码
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              AI 读取或编辑过的文件也可以在对话记录中直接点击定位。
+              左侧对话框读取或修改过的文件也可以在审计流中点击「预览」快速定位。
             </p>
           </div>
         ) : openFile.loading ? (
