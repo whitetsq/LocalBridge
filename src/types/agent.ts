@@ -17,10 +17,18 @@ export interface CompanionWorkspaceInfo {
   noShell: boolean;
   readOnly: boolean;
   version?: string;
+  allowSecrets?: boolean;
   branch?: string;
   dirtyCount?: number;
   stack?: string[];
   gitRepos?: GitRepoSummary[];
+}
+
+export interface CompanionHealth {
+  ok: boolean;
+  latencyMs?: number;
+  lastCheckedAt?: number;
+  error?: string;
 }
 
 export interface CompanionEventItem {
@@ -37,6 +45,11 @@ export interface CompanionEventItem {
   previewAfter?: string;
   filePath?: string;
   command?: string;
+  processId?: string;
+  liveStdout?: string;
+  liveStderr?: string;
+  canRevert?: boolean;
+  reverted?: boolean;
 }
 
 export interface CompanionPendingApprovalItem {
@@ -55,6 +68,7 @@ export interface CompanionPublicState {
   connected: boolean;
   tunnelUrl: string;
   workspace: CompanionWorkspaceInfo | null;
+  health: CompanionHealth;
   policy: SecurityPolicy;
   autoApproveFileWrites: boolean;
   allowlist: string[];

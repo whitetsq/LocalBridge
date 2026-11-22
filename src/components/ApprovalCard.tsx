@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Check, FileDiff, ShieldAlert, Terminal, Trash2, X } from 'lucide-react';
 import { DiffViewer } from './DiffViewer';
 import { suggestAllowlistPrefix } from '../lib/localClient';
@@ -6,9 +6,11 @@ import type { PendingApproval } from '../types/agent';
 
 interface ApprovalCardProps {
   approval: PendingApproval;
+  allowlist?: string[];
+  enableShortcuts?: boolean;
 }
 
-export function ApprovalCard({ approval }: ApprovalCardProps) {
+export function ApprovalCard({ approval, allowlist = [], enableShortcuts = false }: ApprovalCardProps) {
   const [rejectNote, setRejectNote] = useState('');
 
   const isCommand = approval.toolName === 'run_command';
@@ -16,7 +18,26 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
   const isCreateDir = approval.toolName === 'create_directory';
   const isMove = approval.toolName === 'move_path';
   const suggestedPrefix =
-    isCommand && approval.command ? suggestAllowlistPrefix(approval.command) : undefined;
+    isCommand && approval.command ? suggestAllowlistPrefix(approval.command, allowlist) : undefined;
+
+  // Ctrl/Cmd+Enter -> Approve, Escape -> Reject (for the top pending card)
+  useEffect(() => {
+    if (!enableShortcuts) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        approval.resolve({ approved: true });
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        approval.resolve({
+          approved: false,
+          note: rejectNote.trim() || undefined,
+        });
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [enableShortcuts, approval, rejectNote]);
 
   const title = isCommand
     ? '请求执行本机终端命令'
@@ -51,9 +72,16 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
             </>
           )}
         </div>
-        <div className="flex items-center gap-1.5 text-[11px] text-amber-800/90 dark:text-amber-300/90">
-          <ShieldAlert className="w-3.5 h-3.5" />
-          <span>等待人工审批</span>
+        <div className="flex items-center gap-2 text-[11px] text-amber-800/90 dark:text-amber-300/90">
+          {enableShortcuts && (
+            <span className="hidden sm:inline font-mono text-[10.5px] opacity-75">
+              Ctrl+↵ 允许 · Esc 拒绝
+            </span>
+          )}
+          <span className="inline-flex items-center gap-1">
+            <ShieldAlert className="w-3.5 h-3.5" />
+            <span>等待人工审批</span>
+          </span>
         </div>
       </div>
 
@@ -84,7 +112,7 @@ export function ApprovalCard({ approval }: ApprovalCardProps) {
 
         {isDelete && approval.filePath && (
           <div className="p-3 rounded-lg border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/30 text-xs text-rose-700 dark:text-rose-300">
-            此操作将从你本机磁盘删除文件 <code className="font-mono font-semibold">{approval.filePath}</code>，删除后不可直接撤销。
+            此操作将从你本机磁盘删除文件 <code className="font-mono font-semibold">{approval.filePath}</code>，执行后可在审计流中一键回滚恢复。
           </div>
         )}
 

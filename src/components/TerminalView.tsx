@@ -81,15 +81,15 @@ export function TerminalView({
   return (
     <div className="h-full overflow-y-auto px-6 py-6 bg-slate-50 dark:bg-[#0B0F17]">
       <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left: Command runner & execution history */}
+        {/* Left: Command runner & live streaming execution history */}
         <div className="lg:col-span-8 space-y-5">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h1 className="text-lg font-semibold text-slate-950 dark:text-white">
-                本机终端执行与进程控制
+                实时流式终端与进程控制
               </h1>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                通过伴侣隧道在本机执行验证命令，支持子目录切换、超时保护与远程终止进程。
+                所有通过对话伴侣或手动触发的本机命令均实时滚动展示输出流，支持随时终止本机进程树。
               </p>
             </div>
             {commands.length > 0 && (
@@ -99,7 +99,7 @@ export function TerminalView({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                <span>清空日志</span>
+                <span>清空记录</span>
               </button>
             )}
           </div>
@@ -189,7 +189,7 @@ export function TerminalView({
                 暂无命令执行记录
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                手动执行的本机命令以及通过伴侣触发的终端命令都会归档在这里，运行中的命令可随时点击终止。
+                手动执行的本机命令以及通过伴侣触发的编译/测试命令都会实时流式展示在这里，支持一键终止。
               </p>
             </div>
           ) : (
@@ -197,7 +197,7 @@ export function TerminalView({
               {commands.map((item) => {
                 const statusText =
                   item.status === 'running'
-                    ? '运行中'
+                    ? '运行中...'
                     : item.status === 'completed'
                       ? `完成 (exit ${item.exitCode ?? 0})`
                       : item.status === 'killed'
@@ -249,13 +249,15 @@ export function TerminalView({
                       </div>
                     </div>
 
-                    {(item.stdout || item.stderr) && (
-                      <div className="p-3.5 bg-slate-50 dark:bg-[#0B0F17] font-mono text-[12px] leading-relaxed overflow-x-auto max-h-72 overflow-y-auto space-y-2">
-                        {item.stdout && (
+                    {(item.stdout || item.stderr || item.status === 'running') && (
+                      <div className="p-3.5 bg-slate-50 dark:bg-[#0B0F17] font-mono text-[12px] leading-relaxed overflow-x-auto max-h-80 overflow-y-auto space-y-2">
+                        {item.stdout ? (
                           <pre className="whitespace-pre-wrap text-slate-800 dark:text-slate-200">
                             {item.stdout}
                           </pre>
-                        )}
+                        ) : item.status === 'running' && !item.stderr ? (
+                          <div className="text-xs text-slate-400">正在等待终端输出流...</div>
+                        ) : null}
                         {item.stderr && (
                           <pre className="whitespace-pre-wrap text-rose-600 dark:text-rose-400">
                             {item.stderr}
@@ -270,7 +272,7 @@ export function TerminalView({
           )}
         </div>
 
-        {/* Right: Safe Command Allowlist + Bridge v2.0 Script Download */}
+        {/* Right: Safe Command Allowlist + Bridge v2.1 Script Download */}
         <div className="lg:col-span-4 space-y-5">
           <div className="p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] space-y-4">
             <div>
@@ -287,7 +289,7 @@ export function TerminalView({
                 type="text"
                 value={newPrefix}
                 onChange={(e) => setNewPrefix(e.target.value)}
-                placeholder="新增前缀，如 npm run test:layer"
+                placeholder="新增前缀，如 npm run test"
                 className="flex-1 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-[#0B0F17] text-xs font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
               />
               <button
@@ -323,10 +325,10 @@ export function TerminalView({
           <div className="p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] space-y-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-950 dark:text-white">
-                本机脚本 local-bridge.mjs v2.0
+                本机脚本 local-bridge.mjs v2.1
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                零依赖 Node.js v20+ 单文件：支持 <code className="font-mono">--ngrok</code> / <code className="font-mono">--cloudflared</code> 单命令一键配对、多仓库只读 <code className="font-mono">git_inspect</code>、批量 <code className="font-mono">read_files</code>、<code className="font-mono">find_files</code> 及原子多处编辑。
+                零依赖 Node.js v20+ 单文件：支持 <code className="font-mono">--ngrok</code> / <code className="font-mono">--cloudflared</code> 一键配对、NDJSON 实时流式终端、敏感文件硬隔离（默认拦截 <code className="font-mono">.env</code> / 私钥）、多仓库 <code className="font-mono">git_inspect</code> 与进程树终止。
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -336,7 +338,7 @@ export function TerminalView({
                 className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition-colors whitespace-nowrap cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>下载脚本</span>
+                <span>下载 v2.1 脚本</span>
               </button>
               <button
                 type="button"

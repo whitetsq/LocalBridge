@@ -1,109 +1,96 @@
 # LocalBridge
 
-**本地仓库 MCP 桥接与 AI 编程代理控制台** — 通过 Chrome 浏览器安全直连本机目录，让 AI 直接读取源码、审查 Git Diff、提出精确修改审批并执行受控终端命令，无需将电脑暴露到公网。
+**AI 对话伴侣控制台 & 零依赖本地工作区 MCP 桥接** — 让云端 AI 对话安全地读取、搜索、审查多仓库 Git、修改本地代码并实时流式执行终端命令，同时通过浏览器可视化控制面实现**逐行红绿 Diff 审批、一键回滚、安全策略热切换与隧道心跳监管**，全程无需将密钥粘贴进聊天记录。
 
-## 核心特性
+---
 
-- **零公网暴露的浏览器直连架构**：前端运行在 Chrome / Edge 中，直接连接本机 `127.0.0.1` 上的代理服务（内置 Chrome Private Network Access 预检响应头），避免必须开启内网穿透的安全隐患。
-- **双接入模式**：
-  1. **LocalBridge 本机代理（推荐）**：单文件、零第三方依赖的 Node.js (v20+) 脚本 `local-bridge.mjs`，支持完整文件读写、Git Diff、终端命令执行与进程中止。
-  2. **Chrome 本地目录直连**：基于浏览器原生 File System Access API，零脚本一键授权本机目录，支持真实文件读取、全文检索与 Diff 写回（不含终端命令）。
-- **随时切换的三级安全策略**：
-  - **逐条审批**：只读工具自动执行，文件修改与终端命令在执行前弹出带行级 Diff 预览的审批卡片。
-  - **安全白名单**：可自定义安全验证命令前缀（自动拦截管道与链式注入符），支持一键将命令加入白名单。
-  - **只读模式**：完全禁用文件写入与命令执行，适用于纯代码审查与架构分析。
-- **CLI 交互式权限向导**：支持在终端运行 `node local-bridge.mjs setup` 交互选择工作区目录、权限级别（只读 / 读写禁命令 / 完整权限）与监听端口。
-- **兼容标准 MCP 协议**：`local-bridge.mjs` 同时暴露标准 MCP JSON-RPC 2.0 端点（`POST /mcp` 及 `POST /mcp/<token>`），配合内网穿透隧道即可供外部 MCP 客户端（如 ChatGPT 开发者模式、Cursor 等）复用。
+## 核心架构
 
-## 本地开发与部署
+```text
+AI 对话 / Companion CLI (scripts/companion.mjs)
+        │
+        ▼
+LocalBridge 控制面 (server.ts, 仅内存暂存隧道与 Token)
+        ├── SSE 实时推送 ──▶ 浏览器可视化控制台（目录树 / 代码预览 / 多仓库 Git Diff / 审批 / 流式终端 / 一键回滚）
+        └── HTTPS 隧道 ────▶ 本机 local-bridge.mjs (严格绑定 127.0.0.1:4829)
+```
 
-### 环境要求
+---
 
-- Node.js `v20+`
-- 一个有效的 `GEMINI_API_KEY`
+## 核心特性（v2.1）
 
-### 1. 安装依赖
+- **单命令启动 + 一键配对**：`local-bridge.mjs` 内置 `--ngrok` / `--cloudflared` 启动器，自动拉起隧道并输出单行配对串 `https://<tunnel>#token=<secret>`；前端粘贴即可自动拆分填入，并通过 `sessionStorage` 支持刷新后一键重连。
+- **14 项工程级本地工具（含多仓库 Git）**：
+  - 只读探索：`inspect_workspace`（自动发现根与子目录多 Git 仓库）、`list_directory`、`find_files`、`read_file`、`read_files`（单次往返批量读）、`search_files`（扩展名过滤 + 正则 + 上下文行）、`git_inspect`（纯只读 `execFile('git', ...)`，支持指定子仓库 `cwd` 查 `status / diff / staged_diff / log / branches / show`）、`git_diff`。
+  - 受控写入与执行：`edit_file`（支持原子多处替换）、`write_file`、`delete_file`、`create_directory`、`move_path`、`run_command`（支持 NDJSON 实时流式 stdout/stderr 与进程树终止）。
+- **纵深安全防线**：
+  - **三级热切换策略**：`逐条审批`（改文件先看逐行 Diff，支持 `Ctrl/Cmd+Enter` 允许、`Esc` 拒绝与「允许并加入白名单」）、`安全白名单`、`只读模式`。
+  - **改前自动快照 & 一键回滚**：每次 `edit_file` / `write_file` / `delete_file` 落盘前自动备份原文，审计流中点击「回滚」立即还原。
+  - **敏感文件物理拦截**：本机脚本默认禁止读写 `.env*`（放行 `.env.example`）、SSH 私钥（`id_rsa` / `id_ed25519`）、`*.pem`、`*.key`、`credentials.json` 等文件，防止误读进云端对话上下文。
+  - **常量时间 Token 校验 & 路径沙箱**：`crypto.timingSafeEqual` 校验高熵随机 Token，`path.resolve` + `fs.realpath` 防止目录穿越与软链接逃逸。
+- **实时流式终端 + 心跳探活**：编译与测试日志实时逐行滚动展示，支持远程终止进程树；每 30 秒自动探活隧道延迟与在线状态。
+- **兼容标准 MCP 协议**：`local-bridge.mjs` 同时暴露 MCP JSON-RPC 2.0 端点（`POST /mcp` 与 `POST /mcp/<token>`），可供任意外部 MCP 客户端复用。
+
+---
+
+## 快速上手
+
+### 1. 启动控制面服务
+
+环境要求：Node.js `v20+`。
 
 ```bash
 npm install
-```
-
-### 2. 配置环境变量
-
-复制 `.env.example` 为 `.env`，并填入你的 Gemini API Key：
-
-```bash
-cp .env.example .env
-```
-
-```env
-GEMINI_API_KEY="your_gemini_api_key"
-```
-
-### 3. 启动应用
-
-开发模式（Express + Vite）：
-
-```bash
 npm run dev
 ```
 
-生产构建与启动：
+生产构建与运行：
 
 ```bash
 npm run build
 NODE_ENV=production npm start
 ```
 
-访问 `http://localhost:3000` 即可打开 LocalBridge 控制台。
+访问 `http://localhost:3000` 打开 LocalBridge 控制台。
 
-## 使用本机桥接脚本 (`local-bridge.mjs`)
+### 2. 在本机目标仓库启动 `local-bridge.mjs`
 
-1. 打开 LocalBridge 控制台，进入 **本机脚本与 MCP** 页面下载 `local-bridge.mjs`。
-2. 在你的目标代码仓库根目录运行交互式配置向导：
-
-```bash
-# macOS / Linux
-cd /path/to/your-project
-node ~/Downloads/local-bridge.mjs setup
-
-# Windows (CMD / PowerShell)
-cd C:\path\to\your-project
-node %USERPROFILE%\Downloads\local-bridge.mjs setup
-```
-
-3. 也可以通过命令行参数直接启动：
+从控制台下载 `local-bridge.mjs` 后，只需**一个终端**即可同时启动本机代理与公网隧道：
 
 ```bash
-# 直接以当前目录启动
-node local-bridge.mjs
+# 使用 ngrok 自动拉起隧道并生成一键配对串
+node local-bridge.mjs --ngrok --root "/path/to/your-workspace"
 
-# 只读模式（禁止写文件与执行命令）
-node local-bridge.mjs --read-only
+# 或使用 cloudflared
+node local-bridge.mjs --cloudflared --root "/path/to/your-workspace"
 
-# 禁用 Shell 命令执行（仅允许读写文件与 git diff）
-node local-bridge.mjs --no-shell --port 4829
+# 或运行交互式向导（自选目录、权限级别与隧道方式）
+node local-bridge.mjs setup
 ```
 
-4. 复制终端打印的本地地址与随机安全 Token，粘贴到控制台完成连接。
+复制终端打印的 `https://...#token=...` 粘贴到控制面顶部输入框，点击 **「绑定隧道并开启实时监管」** 即可。
 
-## 安全机制说明
-
-- 本机代理默认严格绑定 `127.0.0.1`，不对外网接口开放。
-- 所有工具接口均强制校验高熵随机 `X-Bridge-Token`（采用常量时间比对 `timingSafeEqual`）。
-- 文件访问通过 `path.resolve` 与 `fs.realpath` 双重校验，防止 `../` 路径穿越及软链接逃逸出授权根目录。
-- 终端命令默认注入 `CI=true`、强制超时限制与输出字节上限，并支持在控制台随时中止运行中的进程。
-
-## 作为外部 MCP Server 使用（可选）
-
-如果希望将同一个本机仓库暴露给支持远程 MCP 的外部客户端（如 ChatGPT 开发者模式），可使用 Cloudflare Tunnel 转发本地端口：
+### 3. 通过 Companion CLI 调用本机工具
 
 ```bash
-cloudflared tunnel --url http://127.0.0.1:4829
+node scripts/companion.mjs status
+node scripts/companion.mjs tree . 2
+node scripts/companion.mjs git status <subdir>
+node scripts/companion.mjs find "**/*.ts" src
+node scripts/companion.mjs read package.json:1-60 README.md:1-80
+node scripts/companion.mjs call run_command '{"command":"npm test","cwd":"."}'
 ```
 
-随后在外部客户端中将 MCP Server URL 配置为：
+---
 
-```text
-https://<your-tunnel-domain>/mcp/<your-bridge-token>
-```
+## 命令行安全选项（`local-bridge.mjs`）
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `--root <dir>` | 限定可访问的根目录（默认当前工作目录） |
+| `--port <num>` | 本机监听端口（默认 `4829`，严格绑定 `127.0.0.1`） |
+| `--token <str>` | 固定访问令牌（默认每次启动随机生成 48 位密钥） |
+| `--ngrok` / `--cloudflared` | 自动启动隧道并打印一键配对串 |
+| `--read-only` | 硬只读模式（物理禁止写入、删除、改名与命令） |
+| `--no-shell` | 禁用 `run_command`（保留文件读写与只读 Git） |
+| `--allow-secrets` | 关闭默认敏感文件拦截（不推荐） |

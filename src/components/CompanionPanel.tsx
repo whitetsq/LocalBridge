@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -8,12 +9,18 @@ import {
   Download,
   GitBranch,
   Plug,
+  Plus,
   RefreshCw,
   Shield,
   ShieldCheck,
+  Square,
   Trash2,
+  Undo2,
   Unplug,
+  Volume2,
+  VolumeX,
   Wrench,
+  X,
   XCircle,
 } from 'lucide-react';
 import { ApprovalCard } from './ApprovalCard';
@@ -28,6 +35,11 @@ interface CompanionPanelProps {
   connecting: boolean;
   connectError: string | null;
   hasCachedSession: boolean;
+  soundEnabled: boolean;
+  pinging: boolean;
+  revertingId: string | null;
+  onToggleSound: () => void;
+  onPingHealth: () => Promise<void>;
   onChangeTunnelUrl: (url: string) => void;
   onChangeToken: (token: string) => void;
   onConnect: (override?: { tunnelUrl: string; token: string }) => Promise<void>;
@@ -35,11 +47,14 @@ interface CompanionPanelProps {
   onUpdatePolicy: (patch: {
     policy?: SecurityPolicy;
     autoApproveFileWrites?: boolean;
+    allowlist?: string[];
   }) => Promise<void>;
   onResolveApproval: (
     approvalId: string,
     decision: { approved: boolean; note?: string; addAllowlistPrefix?: string }
   ) => Promise<void>;
+  onRevertEvent: (eventId: string) => Promise<void>;
+  onKillProcess: (processId: string) => Promise<void>;
   onClearEvents: () => Promise<void>;
   onPreviewFile: (path: string) => void;
   onOpenGitRepo: (repoPath: string) => void;
@@ -74,6 +89,10 @@ function formatEventTitle(name: string, args: Record<string, unknown>): string {
       return `edit_file(${String(args.path || '')})`;
     case 'write_file':
       return `write_file(${String(args.path || '')})`;
+    case 'write_files': {
+      const count = Array.isArray(args.files) ? args.files.length : 0;
+      return `write_files(${count} files)`;
+    }
     case 'delete_file':
       return `delete_file(${String(args.path || '')})`;
     case 'create_directory':
@@ -82,6 +101,10 @@ function formatEventTitle(name: string, args: Record<string, unknown>): string {
       return `move_path(${String(args.from || '')} -> ${String(args.to || '')})`;
     case 'run_command':
       return `run_command(${String(args.command || '')})`;
+    case 'revert_restore':
+      return `revert(${String(args.path || '')} 已恢复)`;
+    case 'revert_delete':
+      return `revert(${String(args.path || '')} 已撤回新建)`;
     default:
       return name;
   }
@@ -94,12 +117,19 @@ export function CompanionPanel({
   connecting,
   connectError,
   hasCachedSession,
+  soundEnabled,
+  pinging,
+  revertingId,
+  onToggleSound,
+  onPingHealth,
   onChangeTunnelUrl,
   onChangeToken,
   onConnect,
   onDisconnect,
   onUpdatePolicy,
   onResolveApproval,
+  onRevertEvent,
+  onKillProcess,
   onClearEvents,
   onPreviewFile,
   onOpenGitRepo,
@@ -107,6 +137,24 @@ export function CompanionPanel({
   const [tunnelTool, setTunnelTool] = useState<'ngrok' | 'cloudflared'>('ngrok');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [showAllowlistBar, setShowAllowlistBar] = useState(false);
+  const [allowlistDraft, setAllowlistDraft] = useState('');
+
+  const handleAddAllowlistPrefix = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = allowlistDraft.trim().replace(/\s+/g, ' ');
+    if (!cleaned) return;
+    if (!state.allowlist.includes(cleaned)) {
+      await onUpdatePolicy({ allowlist: [cleaned, ...state.allowlist] });
+    }
+    setAllowlistDraft('');
+  };
+
+  const handleRemoveAllowlistPrefix = async (prefix: string) => {
+    await onUpdatePolicy({
+      allowlist: state.allowlist.filter((item) => item !== prefix),
+    });
+  };
 
   const copy = (key: string, text: string) => {
     navigator.clipboard.writeText(text).catch(() => {});
@@ -164,9 +212,11 @@ export function CompanionPanel({
     await onConnect();
   };
 
+  const healthDegraded = state.connected && !state.health.ok;
+
   return (
     <div className="h-full flex flex-col min-h-0 bg-slate-50 dark:bg-[#0B0F17]">
-      {/* Policy & Kill-Switch Toolbar */}
+      {/* Policy & Controls Toolbar */}
       <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0F1522] flex flex-wrap items-center justify-between gap-3 shrink-0">
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
@@ -202,21 +252,51 @@ export function CompanionPanel({
           </div>
 
           {state.policy === 'allowlist' && (
-            <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={state.autoApproveFileWrites}
-                onChange={(e) =>
-                  onUpdatePolicy({ autoApproveFileWrites: e.target.checked })
-                }
-                className="rounded border-slate-300 dark:border-slate-600 accent-blue-600"
-              />
-              <span className="whitespace-nowrap">自动放行文件修改</span>
-            </label>
+            <>
+              <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={state.autoApproveFileWrites}
+                  onChange={(e) =>
+                    onUpdatePolicy({ autoApproveFileWrites: e.target.checked })
+                  }
+                  className="rounded border-slate-300 dark:border-slate-600 accent-blue-600"
+                />
+                <span className="whitespace-nowrap">自动放行文件修改</span>
+              </label>
+
+              <button
+                type="button"
+                onClick={() => setShowAllowlistBar((v) => !v)}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-mono transition-colors cursor-pointer ${
+                  showAllowlistBar
+                    ? 'bg-blue-600/10 text-blue-700 dark:text-blue-300'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                <span>命令白名单({state.allowlist.length})</span>
+                <ChevronDown
+                  className={`w-3 h-3 transition-transform ${showAllowlistBar ? 'rotate-180' : ''}`}
+                />
+              </button>
+            </>
           )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={onToggleSound}
+            title={soundEnabled ? '关闭审批提示音' : '开启审批提示音'}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+          >
+            {soundEnabled ? (
+              <Volume2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+            ) : (
+              <VolumeX className="w-3.5 h-3.5" />
+            )}
+          </button>
+
           {state.events.length > 0 && (
             <button
               type="button"
@@ -240,6 +320,46 @@ export function CompanionPanel({
         </div>
       </div>
 
+      {state.policy === 'allowlist' && showAllowlistBar && (
+        <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-[#0C121E] space-y-2 shrink-0">
+          <form onSubmit={handleAddAllowlistPrefix} className="flex items-center gap-2">
+            <input
+              type="text"
+              value={allowlistDraft}
+              onChange={(e) => setAllowlistDraft(e.target.value)}
+              placeholder="新增自动放行前缀，如 npm run / node --test / python scripts/（支持 && 串联）"
+              className="flex-1 min-w-0 px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#0B0F17] text-xs font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+            />
+            <button
+              type="submit"
+              disabled={!allowlistDraft.trim()}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>添加前缀</span>
+            </button>
+          </form>
+          <div className="flex flex-wrap items-center gap-1.5 max-h-24 overflow-y-auto">
+            {state.allowlist.map((prefix) => (
+              <span
+                key={prefix}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-mono text-slate-700 dark:text-slate-300"
+              >
+                <span>{prefix}</span>
+                <button
+                  type="button"
+                  onClick={() => handleRemoveAllowlistPrefix(prefix)}
+                  title={`移除 ${prefix}`}
+                  className="text-slate-400 hover:text-rose-500 cursor-pointer"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Main Scrollable Area */}
       <div className="flex-1 overflow-y-auto px-5 py-6">
         <div className="max-w-3xl mx-auto space-y-6">
@@ -250,7 +370,7 @@ export function CompanionPanel({
                   LocalBridge 对话伴侣控制台
                 </h1>
                 <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-                  在这里绑定本机隧道后，直接回到<strong>左侧对话框</strong>指挥读写本地代码、查询多仓库 Git 与执行终端命令；所有写入与命令都会实时推送到此页面展示逐行 Diff 与审批，Token 不会进入聊天记录。
+                  在这里绑定本机隧道后，直接回到<strong>左侧对话框</strong>指挥读写本地代码、查询多仓库 Git 与流式执行终端命令；所有写入与命令都会实时推送到此页面展示逐行 Diff、审批与一键回滚，Token 不会进入聊天记录。
                 </p>
               </div>
 
@@ -287,7 +407,7 @@ export function CompanionPanel({
                       className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <Download className="w-3.5 h-3.5" />
-                      <span>下载 v2.0 脚本</span>
+                      <span>下载 v2.2 脚本</span>
                     </button>
                   </div>
 
@@ -423,16 +543,40 @@ export function CompanionPanel({
             </>
           ) : (
             <>
-              {/* Connected Companion Status Header */}
-              <div className="p-4 rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/60 dark:bg-emerald-950/20 space-y-2.5">
+              {/* Connected Companion Status Header + Heartbeat Health */}
+              <div
+                className={`p-4 rounded-xl border space-y-2.5 ${
+                  healthDegraded
+                    ? 'border-amber-300 dark:border-amber-800/70 bg-amber-50/70 dark:bg-amber-950/20'
+                    : 'border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/60 dark:bg-emerald-950/20'
+                }`}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <ShieldCheck className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    {healthDegraded ? (
+                      <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0" />
+                    ) : (
+                      <ShieldCheck className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    )}
                     <div className="min-w-0 space-y-0.5">
-                      <div className="text-sm font-semibold text-emerald-950 dark:text-emerald-200 truncate">
-                        已连接本机工作区：{state.workspace?.name}
+                      <div
+                        className={`text-sm font-semibold truncate ${
+                          healthDegraded
+                            ? 'text-amber-950 dark:text-amber-200'
+                            : 'text-emerald-950 dark:text-emerald-200'
+                        }`}
+                      >
+                        {healthDegraded
+                          ? `隧道心跳异常：${state.workspace?.name}`
+                          : `已连接本机工作区：${state.workspace?.name}`}
                       </div>
-                      <div className="text-xs font-mono text-emerald-800/80 dark:text-emerald-300/80 flex flex-wrap items-center gap-2">
+                      <div
+                        className={`text-xs font-mono flex flex-wrap items-center gap-2 ${
+                          healthDegraded
+                            ? 'text-amber-800/85 dark:text-amber-300/85'
+                            : 'text-emerald-800/80 dark:text-emerald-300/80'
+                        }`}
+                      >
                         <span>{state.workspace?.rootPath}</span>
                         <span aria-hidden="true">·</span>
                         <span>
@@ -445,12 +589,39 @@ export function CompanionPanel({
                         {state.workspace?.version && (
                           <>
                             <span aria-hidden="true">·</span>
-                            <span>bridge v{state.workspace.version}</span>
+                            <span>v{state.workspace.version}</span>
+                          </>
+                        )}
+                        {!state.workspace?.allowSecrets && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span>敏感文件保护</span>
+                          </>
+                        )}
+                        {state.health.ok && typeof state.health.latencyMs === 'number' && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="tabular-nums">{state.health.latencyMs}ms</span>
                           </>
                         )}
                       </div>
+                      {healthDegraded && state.health.error && (
+                        <div className="text-xs text-rose-700 dark:text-rose-300 pt-0.5">
+                          {state.health.error}
+                        </div>
+                      )}
                     </div>
                   </div>
+
+                  <button
+                    type="button"
+                    disabled={pinging}
+                    onClick={onPingHealth}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300/70 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-xs text-slate-700 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${pinging ? 'animate-spin' : ''}`} />
+                    <span>探活</span>
+                  </button>
                 </div>
 
                 {state.workspace?.gitRepos && state.workspace.gitRepos.length > 0 && (
@@ -479,15 +650,17 @@ export function CompanionPanel({
                 )}
               </div>
 
-              {/* Pending Approval Queue (Real-time SSE) */}
+              {/* Pending Approval Queue (Real-time SSE + Keyboard Shortcuts on first card) */}
               {state.pendingApprovals.length > 0 && (
                 <div className="space-y-3">
                   <div className="text-xs font-semibold text-amber-700 dark:text-amber-300">
                     待审批操作（{state.pendingApprovals.length}）
                   </div>
-                  {state.pendingApprovals.map((item) => (
+                  {state.pendingApprovals.map((item, idx) => (
                     <ApprovalCard
                       key={item.id}
+                      allowlist={state.allowlist}
+                      enableShortcuts={idx === 0}
                       approval={{
                         id: item.id,
                         turnId: item.eventId,
@@ -522,7 +695,7 @@ export function CompanionPanel({
                       正在监听左侧对话框的本地调用...
                     </p>
                     <p className="text-xs text-slate-500 dark:text-slate-400">
-                      现在可以直接在左侧对话框下达指令（读代码、查多仓库 Git、修改文件或运行测试），所有调用与 Diff 审批会实时出现在这里。
+                      现在可以直接在左侧对话框下达指令（读代码、查多仓库 Git、修改文件或运行测试），所有调用、实时终端流与 Diff 审批都会出现在这里。
                     </p>
                   </div>
                 ) : (
@@ -530,6 +703,10 @@ export function CompanionPanel({
                     {state.events.map((ev) => {
                       const expanded = expandedIds.has(ev.id);
                       const fileArg = typeof ev.args.path === 'string' ? ev.args.path : undefined;
+                      const isLiveCmd =
+                        ev.toolName === 'run_command' &&
+                        ev.status === 'running' &&
+                        Boolean(ev.liveStdout || ev.liveStderr || ev.processId);
 
                       return (
                         <div
@@ -554,6 +731,33 @@ export function CompanionPanel({
                             </button>
 
                             <div className="flex items-center gap-2.5 shrink-0 font-mono text-[11px] tabular-nums">
+                              {ev.canRevert && ev.status === 'success' && (
+                                <button
+                                  type="button"
+                                  disabled={revertingId === ev.id}
+                                  onClick={() => onRevertEvent(ev.id)}
+                                  title="将此文件恢复到改动前的快照"
+                                  className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 hover:underline disabled:opacity-40 cursor-pointer"
+                                >
+                                  <Undo2 className="w-3 h-3" />
+                                  <span>{revertingId === ev.id ? '回滚中...' : '回滚'}</span>
+                                </button>
+                              )}
+                              {ev.reverted && (
+                                <span className="text-slate-400">已回滚</span>
+                              )}
+                              {ev.toolName === 'run_command' &&
+                                ev.status === 'running' &&
+                                ev.processId && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onKillProcess(ev.processId!)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-600 text-white hover:bg-rose-700 transition-colors cursor-pointer"
+                                  >
+                                    <Square className="w-2.5 h-2.5" />
+                                    <span>终止</span>
+                                  </button>
+                                )}
                               {fileArg &&
                                 ev.toolName !== 'delete_file' &&
                                 ev.toolName !== 'list_directory' &&
@@ -584,7 +788,23 @@ export function CompanionPanel({
                             </div>
                           </div>
 
-                          {expanded && (
+                          {/* Auto-expanded live streaming terminal preview while command is running */}
+                          {isLiveCmd && (
+                            <div className="px-3.5 py-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-950 text-slate-100 font-mono text-[11.5px] max-h-56 overflow-auto space-y-1.5">
+                              {ev.liveStdout ? (
+                                <pre className="whitespace-pre-wrap">{ev.liveStdout.slice(-6000)}</pre>
+                              ) : !ev.liveStderr ? (
+                                <div className="text-slate-400">正在等待终端输出流...</div>
+                              ) : null}
+                              {ev.liveStderr && (
+                                <pre className="whitespace-pre-wrap text-rose-400">
+                                  {ev.liveStderr.slice(-4000)}
+                                </pre>
+                              )}
+                            </div>
+                          )}
+
+                          {expanded && !isLiveCmd && (
                             <div className="px-3.5 py-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] font-mono text-[11.5px] space-y-2 max-h-72 overflow-auto">
                               <div>
                                 <div className="text-slate-400 mb-1">调用参数</div>

@@ -1,4 +1,6 @@
 import express from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -12,8 +14,8 @@ const app = express();
 app.use(express.json({ limit: '25mb' }));
 
 // ============================================================================
-// Companion Control Plane (AI Studio Chat <-> Right-hand Dashboard <-> Local Tunnel)
-// Credentials live strictly in server process memory — never persisted or printed in chat.
+// LocalBridge Companion Control Plane v2.1
+// Credentials & revert snapshots live strictly in server process memory.
 // ============================================================================
 
 type SecurityPolicy = 'approve' | 'allowlist' | 'readonly';
@@ -31,10 +33,28 @@ interface CompanionWorkspaceInfo {
   noShell: boolean;
   readOnly: boolean;
   version?: string;
+  allowSecrets?: boolean;
   branch?: string;
   dirtyCount?: number;
   stack?: string[];
   gitRepos?: GitRepoSummary[];
+}
+
+interface CompanionHealth {
+  ok: boolean;
+  latencyMs?: number;
+  lastCheckedAt?: number;
+  error?: string;
+}
+
+interface RevertFileEntry {
+  filePath: string;
+  existed: boolean;
+  content: string;
+}
+
+interface RevertSnapshot {
+  entries: RevertFileEntry[];
 }
 
 interface CompanionEventItem {
@@ -51,6 +71,11 @@ interface CompanionEventItem {
   previewAfter?: string;
   filePath?: string;
   command?: string;
+  processId?: string;
+  liveStdout?: string;
+  liveStderr?: string;
+  canRevert?: boolean;
+  reverted?: boolean;
 }
 
 interface CompanionPendingApproval {
@@ -79,6 +104,7 @@ const DEFAULT_COMPANION_ALLOWLIST = [
   'npm run test',
   'npm run lint',
   'npm run build',
+  'node --test',
   'npx tsc',
   'pnpm test',
   'pnpm lint',
@@ -89,7 +115,8 @@ const DEFAULT_COMPANION_ALLOWLIST = [
   'cargo check',
 ];
 
-const SHELL_METACHAR_RE = /[;&|`$><\n\r]/;
+const UNSAFE_METACHAR_RE = /[;|`$><\n\r]/;
+const SINGLE_AMP_RE = /(?:^|[^&])&(?:[^&]|$)/;
 
 const READ_ONLY_TOOLS = new Set([
   'inspect_workspace',
@@ -105,20 +132,27 @@ const READ_ONLY_TOOLS = new Set([
 const WRITE_TOOLS = new Set([
   'edit_file',
   'write_file',
+  'write_files',
   'delete_file',
   'create_directory',
   'move_path',
 ]);
+
+const REVERTABLE_TOOLS = new Set(['edit_file', 'write_file', 'write_files', 'delete_file']);
+
+const SESSION_CACHE_FILE = path.join(os.tmpdir(), 'localbridge-companion-session.json');
 
 const companionState: {
   connected: boolean;
   tunnelUrl: string;
   token: string;
   workspace: CompanionWorkspaceInfo | null;
+  health: CompanionHealth;
   policy: SecurityPolicy;
   autoApproveFileWrites: boolean;
   allowlist: string[];
   events: CompanionEventItem[];
+  revertSnapshots: Map<string, RevertSnapshot>;
   pendingApprovals: Map<string, CompanionPendingApproval>;
   sseClients: Set<express.Response>;
 } = {
@@ -126,26 +160,103 @@ const companionState: {
   tunnelUrl: '',
   token: '',
   workspace: null,
+  health: { ok: false },
   policy: 'approve',
   autoApproveFileWrites: false,
   allowlist: [...DEFAULT_COMPANION_ALLOWLIST],
   events: [],
+  revertSnapshots: new Map(),
   pendingApprovals: new Map(),
   sseClients: new Set(),
 };
+
+function persistEphemeralSession() {
+  if (!companionState.connected || !companionState.tunnelUrl || !companionState.token) return;
+  try {
+    const payload = JSON.stringify({
+      tunnelUrl: companionState.tunnelUrl,
+      token: companionState.token,
+      workspace: companionState.workspace,
+      policy: companionState.policy,
+      autoApproveFileWrites: companionState.autoApproveFileWrites,
+      allowlist: companionState.allowlist,
+      savedAt: Date.now(),
+    });
+    fs.writeFileSync(SESSION_CACHE_FILE, payload, { encoding: 'utf8', mode: 0o600 });
+  } catch {
+    // ignore tmpdir write errors
+  }
+}
+
+function clearEphemeralSession() {
+  try {
+    if (fs.existsSync(SESSION_CACHE_FILE)) {
+      fs.unlinkSync(SESSION_CACHE_FILE);
+    }
+  } catch {
+    // ignore tmpdir unlink errors
+  }
+}
+
+function restoreEphemeralSession() {
+  try {
+    if (!fs.existsSync(SESSION_CACHE_FILE)) return;
+    const raw = fs.readFileSync(SESSION_CACHE_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as {
+      tunnelUrl?: string;
+      token?: string;
+      workspace?: CompanionWorkspaceInfo | null;
+      policy?: SecurityPolicy;
+      autoApproveFileWrites?: boolean;
+      allowlist?: string[];
+    };
+    if (!parsed.tunnelUrl || !parsed.token) return;
+    companionState.connected = true;
+    companionState.tunnelUrl = parsed.tunnelUrl;
+    companionState.token = parsed.token;
+    companionState.workspace = parsed.workspace || null;
+    companionState.health = { ok: true, lastCheckedAt: Date.now() };
+    if (parsed.policy === 'approve' || parsed.policy === 'allowlist' || parsed.policy === 'readonly') {
+      companionState.policy = parsed.policy;
+    }
+    if (typeof parsed.autoApproveFileWrites === 'boolean') {
+      companionState.autoApproveFileWrites = parsed.autoApproveFileWrites;
+    }
+    if (Array.isArray(parsed.allowlist) && parsed.allowlist.length > 0) {
+      companionState.allowlist = parsed.allowlist;
+    }
+  } catch {
+    // ignore malformed cache
+  }
+}
+
+restoreEphemeralSession();
 
 function companionId(prefix: string): string {
   return `${prefix}_${crypto.randomBytes(6).toString('hex')}`;
 }
 
-function isAllowlistedCmd(command: string, allowlist: string[]): boolean {
-  const trimmed = command.trim();
-  if (!trimmed || SHELL_METACHAR_RE.test(trimmed)) return false;
-  const normalized = trimmed.replace(/\s+/g, ' ');
+function isSingleSegmentAllowlisted(segment: string, allowlist: string[]): boolean {
+  const normalized = segment.trim().replace(/\s+/g, ' ');
+  if (!normalized) return false;
   return allowlist.some((raw) => {
     const p = raw.trim().replace(/\s+/g, ' ');
     return Boolean(p) && (normalized === p || normalized.startsWith(`${p} `));
   });
+}
+
+function isAllowlistedCmd(command: string, allowlist: string[]): boolean {
+  const trimmed = command.trim();
+  if (!trimmed || UNSAFE_METACHAR_RE.test(trimmed) || SINGLE_AMP_RE.test(trimmed)) return false;
+  const segments = trimmed.split('&&').map((s) => s.trim());
+  if (segments.some((s) => !s)) return false;
+  return segments.every((seg) => isSingleSegmentAllowlisted(seg, allowlist));
+}
+
+function supportsInlineRevertSnapshot(version?: string): boolean {
+  if (!version) return false;
+  const [maj, min] = version.split('.').map((n) => Number(n) || 0);
+  return maj > 2 || (maj === 2 && min >= 2);
 }
 
 function getPublicCompanionState() {
@@ -153,6 +264,7 @@ function getPublicCompanionState() {
     connected: companionState.connected,
     tunnelUrl: companionState.tunnelUrl,
     workspace: companionState.workspace,
+    health: companionState.health,
     policy: companionState.policy,
     autoApproveFileWrites: companionState.autoApproveFileWrites,
     allowlist: companionState.allowlist,
@@ -192,6 +304,14 @@ function updateCompanionEvent(id: string, patch: Partial<CompanionEventItem>) {
     ev.id === id ? { ...ev, ...patch } : ev
   );
   broadcastCompanionState();
+}
+
+function storeRevertSnapshot(eventId: string, snap: RevertSnapshot) {
+  companionState.revertSnapshots.set(eventId, snap);
+  if (companionState.revertSnapshots.size > 50) {
+    const oldestKey = companionState.revertSnapshots.keys().next().value;
+    if (oldestKey) companionState.revertSnapshots.delete(oldestKey);
+  }
 }
 
 function normalizeTunnelUrl(raw: string): string {
@@ -258,6 +378,231 @@ async function callActiveTunnelTool(
   return (data.result || {}) as Record<string, unknown>;
 }
 
+/**
+ * Streams a `run_command` via local-bridge v2.1's NDJSON `/api/tool-stream`,
+ * gracefully falling back to `/api/tool` if the local script is v2.0/v1.x.
+ */
+async function streamActiveTunnelCommand(
+  args: Record<string, unknown>,
+  onUpdate: (update: { processId?: string; stdout: string; stderr: string }) => void
+): Promise<Record<string, unknown>> {
+  if (!companionState.connected || !companionState.tunnelUrl || !companionState.token) {
+    throw new Error('伴侣隧道尚未连接，请先在右侧 LocalBridge 控制台绑定本机隧道。');
+  }
+
+  const processId = String(args.processId || companionId('proc'));
+  const payloadArgs = { ...args, processId };
+  const url = `${companionState.tunnelUrl}/api/tool-stream`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Bridge-Token': companionState.token,
+      'ngrok-skip-browser-warning': 'true',
+    },
+    body: JSON.stringify({ tool: 'run_command', args: payloadArgs }),
+  });
+
+  // Backward compatibility for v2.0/v1.x bridges that don't expose /api/tool-stream yet
+  if (res.status === 404) {
+    onUpdate({ processId, stdout: '', stderr: '' });
+    return await callActiveTunnelTool('run_command', payloadArgs);
+  }
+
+  if (!res.ok || !res.body) {
+    const errText = await res.text().catch(() => '');
+    let msg = `命令流执行失败 (HTTP ${res.status})`;
+    try {
+      const parsed = JSON.parse(errText) as { error?: string };
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      if (errText.trim()) msg = errText.trim().slice(0, 300);
+    }
+    throw new Error(msg);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let stdout = '';
+  let stderr = '';
+  let activePid = processId;
+  let finalResult: Record<string, unknown> | null = null;
+  let lastEmit = 0;
+
+  const flushUpdate = (force = false) => {
+    const now = Date.now();
+    if (force || now - lastEmit >= 160) {
+      lastEmit = now;
+      onUpdate({ processId: activePid, stdout, stderr });
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nlIdx = buffer.indexOf('\n');
+    while (nlIdx !== -1) {
+      const line = buffer.slice(0, nlIdx).trim();
+      buffer = buffer.slice(nlIdx + 1);
+      if (line) {
+        try {
+          const msg = JSON.parse(line) as {
+            type?: string;
+            processId?: string;
+            chunk?: string;
+            result?: Record<string, unknown>;
+            error?: string;
+          };
+          if (msg.type === 'start' && msg.processId) {
+            activePid = msg.processId;
+            flushUpdate(true);
+          } else if (msg.type === 'stdout' && typeof msg.chunk === 'string') {
+            if (stdout.length < 160000) stdout += msg.chunk;
+            flushUpdate();
+          } else if (msg.type === 'stderr' && typeof msg.chunk === 'string') {
+            if (stderr.length < 160000) stderr += msg.chunk;
+            flushUpdate();
+          } else if (msg.type === 'done' && msg.result) {
+            finalResult = msg.result;
+          } else if (msg.type === 'error') {
+            throw new Error(msg.error || '命令执行出错');
+          }
+        } catch (err) {
+          if (err instanceof SyntaxError) {
+            // ignore non-JSON partial frames
+          } else {
+            throw err;
+          }
+        }
+      }
+      nlIdx = buffer.indexOf('\n');
+    }
+  }
+
+  flushUpdate(true);
+  return (
+    finalResult || {
+      processId: activePid,
+      exitCode: 0,
+      stdout,
+      stderr,
+    }
+  );
+}
+
+async function capturePreWriteSnapshot(
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<RevertSnapshot | null> {
+  if (!REVERTABLE_TOOLS.has(toolName)) return null;
+  if (toolName === 'write_files') {
+    const specs = Array.isArray(args.files) ? (args.files as Array<{ path?: unknown }>) : [];
+    if (specs.length === 0) return null;
+    const entries: RevertFileEntry[] = [];
+    for (const item of specs) {
+      const fp = String(item.path || '');
+      if (!fp) return null;
+      try {
+        const existing = await callActiveTunnelTool('read_file', {
+          path: fp,
+          startLine: 1,
+          endLine: 20000,
+        });
+        if (existing.truncated) return null;
+        entries.push({
+          filePath: String(existing.path || fp),
+          existed: true,
+          content: String(existing.content ?? ''),
+        });
+      } catch {
+        entries.push({ filePath: fp, existed: false, content: '' });
+      }
+    }
+    return { entries };
+  }
+
+  const filePath = String(args.path || '');
+  if (!filePath) return null;
+  try {
+    const existing = await callActiveTunnelTool('read_file', {
+      path: filePath,
+      startLine: 1,
+      endLine: 20000,
+    });
+    if (existing.truncated) return null; // avoid truncating huge files on revert
+    return {
+      entries: [
+        {
+          filePath: String(existing.path || filePath),
+          existed: true,
+          content: String(existing.content ?? ''),
+        },
+      ],
+    };
+  } catch {
+    if (toolName === 'write_file') {
+      return { entries: [{ filePath, existed: false, content: '' }] };
+    }
+    return null;
+  }
+}
+
+function extractInlineRevertSnapshot(
+  toolName: string,
+  rawResult: Record<string, unknown>
+): { snapshot: RevertSnapshot | null; sanitizedResult: Record<string, unknown> } {
+  const sanitized = { ...rawResult };
+  delete sanitized.previousContent;
+  delete sanitized.previousFiles;
+
+  if (!REVERTABLE_TOOLS.has(toolName)) {
+    return { snapshot: null, sanitizedResult: sanitized };
+  }
+
+  if (toolName === 'write_files' && Array.isArray(rawResult.previousFiles)) {
+    const prevList = rawResult.previousFiles as Array<{
+      filePath?: unknown;
+      existed?: unknown;
+      content?: unknown;
+    }>;
+    if (prevList.every((p) => !p.existed || typeof p.content === 'string')) {
+      return {
+        snapshot: {
+          entries: prevList.map((p) => ({
+            filePath: String(p.filePath || ''),
+            existed: Boolean(p.existed),
+            content: String(p.content ?? ''),
+          })),
+        },
+        sanitizedResult: sanitized,
+      };
+    }
+    return { snapshot: null, sanitizedResult: sanitized };
+  }
+
+  const fp = String(rawResult.path || '');
+  const existed = Boolean(rawResult.existed);
+  if (!fp) return { snapshot: null, sanitizedResult: sanitized };
+  if (existed && typeof rawResult.previousContent !== 'string') {
+    return { snapshot: null, sanitizedResult: sanitized };
+  }
+  return {
+    snapshot: {
+      entries: [
+        {
+          filePath: fp,
+          existed,
+          content: existed ? String(rawResult.previousContent ?? '') : '',
+        },
+      ],
+    },
+    sanitizedResult: sanitized,
+  };
+}
+
 async function prepareCompanionPreview(
   toolName: string,
   args: Record<string, unknown>
@@ -310,7 +655,59 @@ async function prepareCompanionPreview(
   return {};
 }
 
-// Companion REST + SSE endpoints
+// Background tunnel heartbeat every 30s while connected (tolerates single transient CPU/tunnel spike)
+let consecutiveHealthFailures = 0;
+
+async function probeTunnelHealth(immediate = false): Promise<CompanionHealth> {
+  if (!companionState.connected || !companionState.tunnelUrl || !companionState.token) {
+    consecutiveHealthFailures = 0;
+    companionState.health = { ok: false };
+    return companionState.health;
+  }
+  const t0 = Date.now();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    await fetchTunnelJson(companionState.tunnelUrl, companionState.token, '/health', {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    consecutiveHealthFailures = 0;
+    companionState.health = {
+      ok: true,
+      latencyMs: Date.now() - t0,
+      lastCheckedAt: Date.now(),
+    };
+  } catch (err) {
+    consecutiveHealthFailures++;
+    const errMsg = err instanceof Error ? err.message : '隧道探活失败';
+    if (immediate || consecutiveHealthFailures >= 2) {
+      companionState.health = {
+        ok: false,
+        lastCheckedAt: Date.now(),
+        error: errMsg,
+      };
+    }
+  }
+  broadcastCompanionState();
+  return companionState.health;
+}
+
+if (companionState.connected) {
+  probeTunnelHealth().catch(() => {});
+}
+
+setInterval(() => {
+  if (companionState.connected) {
+    probeTunnelHealth().catch(() => {});
+  }
+}, 30000);
+
+// ============================================================================
+// Companion REST & SSE Routes
+// ============================================================================
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, mode: 'companion-control-plane', connected: companionState.connected });
 });
@@ -354,7 +751,9 @@ app.post('/api/companion/connect', async (req, res) => {
       return;
     }
 
+    const t0 = Date.now();
     const health = await fetchTunnelJson(tunnelUrl, token, '/health', { method: 'GET' });
+    const latencyMs = Date.now() - t0;
     const inspectedRes = await fetchTunnelJson(tunnelUrl, token, '/api/tool', {
       method: 'POST',
       body: JSON.stringify({ tool: 'inspect_workspace', args: { maxDepth: 2 } }),
@@ -364,12 +763,14 @@ app.post('/api/companion/connect', async (req, res) => {
     companionState.connected = true;
     companionState.tunnelUrl = tunnelUrl;
     companionState.token = token;
+    companionState.health = { ok: true, latencyMs, lastCheckedAt: Date.now() };
     companionState.workspace = {
       name: String(health.name || inspected.name || 'local-workspace'),
       rootPath: String(health.rootPath || inspected.rootPath || '.'),
       noShell: Boolean(health.noShell ?? inspected.noShell),
       readOnly: Boolean(health.readOnly ?? inspected.readOnly),
       version: typeof health.version === 'string' ? health.version : undefined,
+      allowSecrets: Boolean(health.allowSecrets ?? inspected.allowSecrets),
       branch: typeof inspected.branch === 'string' ? inspected.branch : undefined,
       dirtyCount: typeof inspected.dirtyCount === 'number' ? inspected.dirtyCount : undefined,
       stack: Array.isArray(inspected.stack) ? inspected.stack.map(String) : undefined,
@@ -378,6 +779,7 @@ app.post('/api/companion/connect', async (req, res) => {
         : undefined,
     };
 
+    persistEphemeralSession();
     broadcastCompanionState();
     res.json({ ok: true, state: getPublicCompanionState() });
   } catch (err) {
@@ -386,15 +788,23 @@ app.post('/api/companion/connect', async (req, res) => {
   }
 });
 
+app.post('/api/companion/ping', async (_req, res) => {
+  const health = await probeTunnelHealth(true);
+  res.json({ ok: health.ok, health });
+});
+
 app.post('/api/companion/disconnect', (_req, res) => {
   for (const pending of companionState.pendingApprovals.values()) {
     pending.resolve({ approved: false, note: '用户已断开伴侣隧道' });
   }
   companionState.pendingApprovals.clear();
+  companionState.revertSnapshots.clear();
   companionState.connected = false;
   companionState.tunnelUrl = '';
   companionState.token = '';
   companionState.workspace = null;
+  companionState.health = { ok: false };
+  clearEphemeralSession();
   broadcastCompanionState();
   res.json({ ok: true, state: getPublicCompanionState() });
 });
@@ -414,12 +824,14 @@ app.post('/api/companion/policy', (req, res) => {
   if (Array.isArray(body.allowlist)) {
     companionState.allowlist = body.allowlist.map((s) => String(s).trim()).filter(Boolean);
   }
+  persistEphemeralSession();
   broadcastCompanionState();
   res.json({ ok: true, state: getPublicCompanionState() });
 });
 
 app.post('/api/companion/events/clear', (_req, res) => {
   companionState.events = [];
+  companionState.revertSnapshots.clear();
   broadcastCompanionState();
   res.json({ ok: true });
 });
@@ -440,6 +852,7 @@ app.post('/api/companion/approvals/:id/resolve', (req, res) => {
     const prefix = body.addAllowlistPrefix.trim();
     if (prefix && !companionState.allowlist.includes(prefix)) {
       companionState.allowlist = [prefix, ...companionState.allowlist];
+      persistEphemeralSession();
     }
   }
   companionState.pendingApprovals.delete(id);
@@ -452,7 +865,46 @@ app.post('/api/companion/approvals/:id/resolve', (req, res) => {
   res.json({ ok: true });
 });
 
-// Direct UI proxy (file tree, file preview, git inspect, manual terminal commands)
+// 1-Click Revert for edit_file / write_file / write_files / delete_file events
+app.post('/api/companion/revert/:eventId', async (req, res) => {
+  try {
+    const eventId = req.params.eventId;
+    const snap = companionState.revertSnapshots.get(eventId);
+    if (!snap || snap.entries.length === 0) {
+      res.status(404).json({ error: '该操作没有可用的回滚快照（可能已回滚或超过历史上限）' });
+      return;
+    }
+    for (const entry of snap.entries) {
+      if (entry.existed) {
+        await callActiveTunnelTool('write_file', {
+          path: entry.filePath,
+          content: entry.content,
+        });
+      } else {
+        await callActiveTunnelTool('delete_file', { path: entry.filePath });
+      }
+    }
+    companionState.revertSnapshots.delete(eventId);
+    updateCompanionEvent(eventId, { canRevert: false, reverted: true });
+    const primaryPath = snap.entries[0].filePath;
+    pushCompanionEvent({
+      id: companionId('ev'),
+      toolName: snap.entries[0].existed ? 'revert_restore' : 'revert_delete',
+      args: { path: primaryPath, count: snap.entries.length, revertedEventId: eventId },
+      status: 'success',
+      source: 'ui',
+      startedAt: Date.now(),
+      durationMs: 0,
+      filePath: primaryPath,
+      result: { count: snap.entries.length, path: primaryPath },
+    });
+    res.json({ ok: true, filePath: primaryPath });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Direct UI proxy (file tree, file preview, git inspect, manual streaming commands)
 app.post('/api/companion/ui-tool', async (req, res) => {
   try {
     const body = (req.body || {}) as { tool?: string; args?: Record<string, unknown> };
@@ -461,6 +913,55 @@ app.post('/api/companion/ui-tool', async (req, res) => {
       res.status(400).json({ error: '缺少 tool 名称' });
       return;
     }
+    if (tool === 'run_command') {
+      const eventId = companionId('ev');
+      const processId = String(body.args?.processId || companionId('proc'));
+      const startedAt = Date.now();
+      const command = String(body.args?.command || '');
+      pushCompanionEvent({
+        id: eventId,
+        toolName: 'run_command',
+        args: { ...(body.args || {}), processId },
+        status: 'running',
+        source: 'ui',
+        startedAt,
+        command,
+        processId,
+        liveStdout: '',
+        liveStderr: '',
+      });
+      try {
+        const result = await streamActiveTunnelCommand(
+          { ...(body.args || {}), processId },
+          ({ processId: pid, stdout, stderr }) => {
+            updateCompanionEvent(eventId, {
+              processId: pid || processId,
+              liveStdout: stdout,
+              liveStderr: stderr,
+            });
+          }
+        );
+        const exitCode = typeof result.exitCode === 'number' ? result.exitCode : 0;
+        updateCompanionEvent(eventId, {
+          status: exitCode === 0 ? 'success' : 'error',
+          result,
+          liveStdout: String(result.stdout || ''),
+          liveStderr: String(result.stderr || ''),
+          durationMs: Date.now() - startedAt,
+        });
+        res.json({ ok: true, result });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        updateCompanionEvent(eventId, {
+          status: 'error',
+          error: message,
+          durationMs: Date.now() - startedAt,
+        });
+        res.status(400).json({ error: message });
+      }
+      return;
+    }
+
     const result = await callActiveTunnelTool(tool, body.args || {});
     res.json({ ok: true, result });
   } catch (err) {
@@ -491,7 +992,7 @@ app.post('/api/companion/kill', async (req, res) => {
   }
 });
 
-// Companion chat execution gate (enforces policy + live UI diff/command approval)
+// Companion chat execution gate (enforces policy + live UI diff/command approval + streaming + revert snapshot)
 app.post('/api/companion/call', async (req, res) => {
   const body = (req.body || {}) as { tool?: string; args?: Record<string, unknown> };
   const toolName = String(body.tool || '').trim();
@@ -624,11 +1125,47 @@ app.post('/api/companion/call', async (req, res) => {
   }
 
   try {
-    const result = await callActiveTunnelTool(toolName, args);
+    // v2.2+ returns previousContent inline (1 tunnel RTT instead of 2); fallback to pre-read for v2.1
+    const useInlineSnap = supportsInlineRevertSnapshot(companionState.workspace?.version);
+    const preSnap = useInlineSnap ? null : await capturePreWriteSnapshot(toolName, args);
+
+    let result: Record<string, unknown>;
+    let effectiveSnap: RevertSnapshot | null = preSnap;
+
+    if (toolName === 'run_command') {
+      const processId = String(args.processId || companionId('proc'));
+      updateCompanionEvent(eventId, { processId, liveStdout: '', liveStderr: '' });
+      result = await streamActiveTunnelCommand(
+        { ...args, processId },
+        ({ processId: pid, stdout, stderr }) => {
+          updateCompanionEvent(eventId, {
+            processId: pid || processId,
+            liveStdout: stdout,
+            liveStderr: stderr,
+          });
+        }
+      );
+    } else {
+      const rawResult = await callActiveTunnelTool(toolName, args);
+      const extracted = extractInlineRevertSnapshot(toolName, rawResult);
+      result = extracted.sanitizedResult;
+      if (extracted.snapshot) {
+        effectiveSnap = extracted.snapshot;
+      }
+    }
+
+    if (effectiveSnap) {
+      storeRevertSnapshot(eventId, effectiveSnap);
+    }
+
     const durationMs = Date.now() - startedAt;
+    const exitCode = toolName === 'run_command' && typeof result.exitCode === 'number' ? result.exitCode : 0;
     updateCompanionEvent(eventId, {
-      status: 'success',
+      status: exitCode === 0 ? 'success' : 'error',
       result,
+      liveStdout: toolName === 'run_command' ? String(result.stdout || '') : undefined,
+      liveStderr: toolName === 'run_command' ? String(result.stderr || '') : undefined,
+      canRevert: Boolean(effectiveSnap),
       durationMs,
     });
     res.json({ ok: true, result, durationMs });
@@ -653,6 +1190,7 @@ app.use('/api', (err: unknown, _req: express.Request, res: express.Response, _ne
 
 async function startServer() {
   if (!isProduction) {
+    process.env.DISABLE_HMR = 'true';
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
       appType: 'spa',
@@ -668,7 +1206,7 @@ async function startServer() {
 
   const PORT = 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LocalBridge Companion Control Plane running on http://0.0.0.0:${PORT}`);
+    console.log(`LocalBridge Companion Control Plane v2.1 running on http://0.0.0.0:${PORT}`);
   });
 }
 

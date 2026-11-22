@@ -17,10 +17,6 @@ import type {
 
 const SESSION_KEY = 'localbridge.companion.session';
 
-function uid(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-}
-
 function updateTreeChildren(nodes: FileNode[], targetPath: string, children: FileNode[]): FileNode[] {
   return nodes.map((node) => {
     if (node.path === targetPath) {
@@ -47,12 +43,40 @@ function readCachedSession(): { tunnelUrl: string; token: string } | null {
   return null;
 }
 
+function playGentleApprovalChime() {
+  try {
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(660, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.11);
+    gain.gain.setValueAtTime(0.06, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.24);
+    osc.onended = () => {
+      ctx.close().catch(() => {});
+    };
+  } catch {
+    // ignore autoplay / audio context restrictions
+  }
+}
+
 export function App() {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     const saved = localStorage.getItem('localbridge.theme');
     if (saved === 'light') return false;
     if (saved === 'dark') return true;
     return true;
+  });
+
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('localbridge.sound') === 'on';
   });
 
   const [activeView, setActiveView] = useState<MainView>('companion');
@@ -63,6 +87,7 @@ export function App() {
     connected: false,
     tunnelUrl: '',
     workspace: null,
+    health: { ok: false },
     policy: 'approve',
     autoApproveFileWrites: false,
     allowlist: DEFAULT_SAFE_ALLOWLIST,
@@ -76,6 +101,8 @@ export function App() {
   const [hasCachedSession, setHasCachedSession] = useState<boolean>(Boolean(initialCached));
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [pinging, setPinging] = useState(false);
+  const [revertingId, setRevertingId] = useState<string | null>(null);
 
   // File tree, open file preview, and multi-repo Git state
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -90,18 +117,30 @@ export function App() {
   const [gitLogText, setGitLogText] = useState('');
   const [diffLoading, setDiffLoading] = useState(false);
 
-  // Manual command history (merged with companion run_command records in TerminalView)
-  const [manualCommands, setManualCommands] = useState<CommandRecord[]>([]);
   const prevConnectedRef = useRef(false);
+  const prevPendingCountRef = useRef(0);
+  const autoReconnectKeyRef = useRef<string | null>(null);
+  const sseInitializedRef = useRef(false);
+  const soundEnabledRef = useRef(soundEnabled);
+  soundEnabledRef.current = soundEnabled;
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
     localStorage.setItem('localbridge.theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
-  // Browser tab title notification for pending approvals
+  useEffect(() => {
+    localStorage.setItem('localbridge.sound', soundEnabled ? 'on' : 'off');
+  }, [soundEnabled]);
+
+  // Browser tab title notification + optional chime for new pending approvals
   useEffect(() => {
     const pending = companionState.pendingApprovals.length;
+    if (pending > prevPendingCountRef.current && soundEnabledRef.current) {
+      playGentleApprovalChime();
+    }
+    prevPendingCountRef.current = pending;
+
     if (pending > 0) {
       document.title = `(${pending} 待审批) LocalBridge`;
     } else if (companionState.connected && companionState.workspace?.name) {
@@ -117,7 +156,11 @@ export function App() {
     es.onmessage = (event) => {
       try {
         const next = JSON.parse(event.data) as CompanionPublicState;
+        sseInitializedRef.current = true;
         setCompanionState(next);
+        if (next.connected) {
+          autoReconnectKeyRef.current = null;
+        }
         if (next.tunnelUrl) {
           setTunnelUrlInput((prev) => prev || next.tunnelUrl);
         }
@@ -168,7 +211,6 @@ export function App() {
     async (repoPath: string) => {
       setDiffLoading(true);
       try {
-        // Prefer v2.0 git_inspect (supports multi-repo cwd + status + diff + log)
         const [statusRes, diffRes, logRes] = await Promise.all([
           callUiTool('git_inspect', { cwd: repoPath, action: 'status' }),
           callUiTool('git_inspect', { cwd: repoPath, action: 'diff' }),
@@ -178,7 +220,6 @@ export function App() {
         setGitDiffText(String(diffRes.output || ''));
         setGitLogText(String(logRes.output || '').trim());
       } catch {
-        // Backward-compatible fallback for v1.x local-bridge.mjs
         try {
           const fallback = await callUiTool('git_diff', { cwd: repoPath });
           setGitStatusText(String(fallback.status || ''));
@@ -216,7 +257,7 @@ export function App() {
     prevConnectedRef.current = nowConnected;
   }, [companionState.connected, companionState.workspace?.gitRepos, refreshFileTree, refreshGitForRepo]);
 
-  // Connect / Disconnect / Policy / Approval handlers
+  // Connect / Disconnect / Health Ping / Policy / Approval / Revert / Kill handlers
   const handleConnect = useCallback(
     async (override?: { tunnelUrl: string; token: string }) => {
       const targetUrl = (override?.tunnelUrl ?? tunnelUrlInput).trim();
@@ -258,18 +299,39 @@ export function App() {
     [tunnelUrlInput, tokenInput]
   );
 
+  // Silent auto-reconnect when server restarts or container wakes up while tab has cached session
+  useEffect(() => {
+    if (!sseInitializedRef.current || companionState.connected || connecting) return;
+    const cached = readCachedSession();
+    if (!cached) return;
+    const sessionKey = `${cached.tunnelUrl}#${cached.token}`;
+    if (autoReconnectKeyRef.current === sessionKey) return;
+    autoReconnectKeyRef.current = sessionKey;
+    handleConnect(cached);
+  }, [companionState, connecting, handleConnect]);
+
   const handleDisconnect = useCallback(async () => {
+    autoReconnectKeyRef.current = '__manual_disconnect__';
     try {
-      await fetch('/api/companion/disconnect', { method: 'POST' });
+      sessionStorage.removeItem(SESSION_KEY);
     } catch {
       // ignore
     }
     setTokenInput('');
     setHasCachedSession(false);
     try {
-      sessionStorage.removeItem(SESSION_KEY);
+      await fetch('/api/companion/disconnect', { method: 'POST' });
     } catch {
       // ignore
+    }
+  }, []);
+
+  const handlePingHealth = useCallback(async () => {
+    setPinging(true);
+    try {
+      await fetch('/api/companion/ping', { method: 'POST' });
+    } finally {
+      setPinging(false);
     }
   }, []);
 
@@ -301,6 +363,53 @@ export function App() {
     },
     []
   );
+
+  const handleRevertEvent = useCallback(
+    async (eventId: string) => {
+      setRevertingId(eventId);
+      try {
+        const res = await fetch(`/api/companion/revert/${encodeURIComponent(eventId)}`, {
+          method: 'POST',
+        });
+        const data = (await res.json()) as { ok?: boolean; filePath?: string; error?: string };
+        if (res.ok && data.ok) {
+          refreshGitForRepo(selectedGitRepo);
+          if (data.filePath && openFile?.path === data.filePath) {
+            // Re-read previewed file so UI reflects reverted content
+            const fresh = await callUiTool('read_file', {
+              path: data.filePath,
+              startLine: 1,
+              endLine: 500,
+            }).catch(() => null);
+            if (fresh) {
+              setOpenFile({
+                path: String(fresh.path || data.filePath),
+                content: String(fresh.content ?? ''),
+                totalLines: Number(fresh.totalLines || 0),
+                truncated: Boolean(fresh.truncated),
+                loading: false,
+              });
+            }
+          }
+        }
+      } finally {
+        setRevertingId(null);
+      }
+    },
+    [callUiTool, openFile?.path, refreshGitForRepo, selectedGitRepo]
+  );
+
+  const handleKillProcess = useCallback(async (processId: string) => {
+    try {
+      await fetch('/api/companion/kill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ processId }),
+      });
+    } catch (err) {
+      console.error('Failed to kill remote process:', err);
+    }
+  }, []);
 
   const handleClearEvents = useCallback(async () => {
     await fetch('/api/companion/events/clear', { method: 'POST' });
@@ -358,87 +467,25 @@ export function App() {
     [callUiTool]
   );
 
-  // Manual command runner + remote tunnel kill
+  // Manual command execution now streams through server.ts SSE events seamlessly
   const handleRunManualCommand = useCallback(
     async (command: string, cwd: string) => {
-      const id = uid('cmd');
-      const processId = uid('proc');
-      const startedAt = Date.now();
-      setManualCommands((prev) => [
-        {
-          id,
-          processId,
-          command,
-          cwd,
-          status: 'running',
-          stdout: '',
-          stderr: '',
-          startedAt,
-          source: 'manual',
-        },
-        ...prev,
-      ]);
-
       try {
-        const res = await callUiTool('run_command', {
+        await callUiTool('run_command', {
           command,
           cwd,
-          timeoutMs: 60000,
-          processId,
+          timeoutMs: 90000,
         });
-        const exitCode = typeof res.exitCode === 'number' ? res.exitCode : 0;
-        setManualCommands((prev) =>
-          prev.map((c) =>
-            c.id === id
-              ? {
-                  ...c,
-                  status: exitCode === 0 ? 'completed' : 'failed',
-                  exitCode,
-                  stdout: String(res.stdout || ''),
-                  stderr: String(res.stderr || ''),
-                  durationMs: Number(res.durationMs || Date.now() - startedAt),
-                }
-              : c
-          )
-        );
-      } catch (err) {
-        setManualCommands((prev) =>
-          prev.map((c) =>
-            c.id === id
-              ? {
-                  ...c,
-                  status: 'failed',
-                  exitCode: -1,
-                  stderr: err instanceof Error ? err.message : String(err),
-                  durationMs: Date.now() - startedAt,
-                }
-              : c
-          )
-        );
+      } catch {
+        // Error state is already pushed into the SSE event stream
       }
     },
     [callUiTool]
   );
 
-  const handleKillCommand = useCallback(async (record: CommandRecord) => {
-    if (!record.processId) return;
-    try {
-      await fetch('/api/companion/kill', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ processId: record.processId }),
-      });
-      setManualCommands((prev) =>
-        prev.map((c) => (c.id === record.id ? { ...c, status: 'killed' } : c))
-      );
-    } catch (err) {
-      console.error('Failed to kill remote command:', err);
-    }
-  }, []);
-
-  // Merge manual commands + companion run_command audit events for TerminalView
+  // Unified live-streaming command records (both companion-triggered and manual)
   const allCommands = useMemo<CommandRecord[]>(() => {
-    const fromCompanion: CommandRecord[] = companionState.events
+    return companionState.events
       .filter((ev) => ev.toolName === 'run_command')
       .map((ev) => {
         const res = ev.result || {};
@@ -451,25 +498,33 @@ export function App() {
               : ev.status === 'error' || (typeof exitCode === 'number' && exitCode !== 0)
                 ? 'failed'
                 : 'completed';
+        const stdout =
+          ev.status === 'running'
+            ? String(ev.liveStdout ?? '')
+            : String(res.stdout ?? ev.liveStdout ?? '');
+        const stderr =
+          ev.status === 'running'
+            ? String(ev.liveStderr ?? '')
+            : String(res.stderr ?? ev.liveStderr ?? ev.error ?? '');
+
         return {
           id: ev.id,
-          processId: typeof res.processId === 'string' ? res.processId : undefined,
+          processId: ev.processId || (typeof res.processId === 'string' ? res.processId : undefined),
           command: String(ev.args.command || ev.command || ''),
           cwd: String(ev.args.cwd || '.'),
           status,
           exitCode,
-          stdout: String(res.stdout || ''),
-          stderr: String(res.stderr || ev.error || ''),
+          stdout,
+          stderr,
           durationMs: ev.durationMs,
           startedAt: ev.startedAt,
-          source: 'companion',
+          source: ev.source === 'ui' ? 'manual' : 'companion',
         };
       });
-
-    return [...manualCommands, ...fromCompanion].sort((a, b) => b.startedAt - a.startedAt);
-  }, [manualCommands, companionState.events]);
+  }, [companionState.events]);
 
   const gitRepos = companionState.workspace?.gitRepos || [];
+  const healthDegraded = companionState.connected && !companionState.health.ok;
 
   return (
     <div className="h-screen flex flex-col bg-slate-50 dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100 overflow-hidden">
@@ -530,18 +585,27 @@ export function App() {
             type="button"
             onClick={() => setActiveView('companion')}
             className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              companionState.connected
-                ? 'bg-emerald-600/10 text-emerald-700 dark:text-emerald-300 border border-emerald-600/30 hover:bg-emerald-600/15'
-                : 'bg-blue-600 text-white hover:bg-blue-700'
+              healthDegraded
+                ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/40 hover:bg-amber-500/20'
+                : companionState.connected
+                  ? 'bg-emerald-600/10 text-emerald-700 dark:text-emerald-300 border border-emerald-600/30 hover:bg-emerald-600/15'
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
             }`}
           >
             {companionState.connected && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" aria-hidden="true" />
+              <span
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                  healthDegraded ? 'bg-amber-500' : 'bg-emerald-500'
+                }`}
+                aria-hidden="true"
+              />
             )}
             <span>
-              {companionState.connected
-                ? `已连接 · ${companionState.workspace?.name || 'local'}`
-                : '连接本机隧道'}
+              {healthDegraded
+                ? `心跳异常 · ${companionState.workspace?.name || 'local'}`
+                : companionState.connected
+                  ? `已连接 · ${companionState.workspace?.name || 'local'}`
+                  : '连接本机隧道'}
             </span>
           </button>
         </div>
@@ -611,12 +675,19 @@ export function App() {
                 connecting={connecting}
                 connectError={connectError}
                 hasCachedSession={hasCachedSession}
+                soundEnabled={soundEnabled}
+                pinging={pinging}
+                revertingId={revertingId}
+                onToggleSound={() => setSoundEnabled((v) => !v)}
+                onPingHealth={handlePingHealth}
                 onChangeTunnelUrl={setTunnelUrlInput}
                 onChangeToken={setTokenInput}
                 onConnect={handleConnect}
                 onDisconnect={handleDisconnect}
                 onUpdatePolicy={handleUpdatePolicy}
                 onResolveApproval={handleResolveApproval}
+                onRevertEvent={handleRevertEvent}
+                onKillProcess={handleKillProcess}
                 onClearEvents={handleClearEvents}
                 onPreviewFile={(fp) => {
                   handleOpenFile(fp);
@@ -785,8 +856,10 @@ export function App() {
             commands={allCommands}
             allowlist={companionState.allowlist}
             onRunManualCommand={handleRunManualCommand}
-            onKillCommand={handleKillCommand}
-            onClearCommands={() => setManualCommands([])}
+            onKillCommand={(record) =>
+              record.processId ? handleKillProcess(record.processId) : Promise.resolve()
+            }
+            onClearCommands={handleClearEvents}
             onAddAllowlist={(prefix) => {
               const next = companionState.allowlist.includes(prefix)
                 ? companionState.allowlist

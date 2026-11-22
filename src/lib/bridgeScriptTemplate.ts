@@ -1,7 +1,7 @@
 export function getLocalBridgeScript(): string {
   return `#!/usr/bin/env node
 /**
- * LocalBridge v2.0 — 零依赖本地工作区桥接与隧道伴侣服务（支持 MCP JSON-RPC 2.0）
+ * LocalBridge v2.2 — 零依赖本地工作区桥接与隧道伴侣服务（支持实时流式终端 + CRLF 自适应编辑 + 批量原子写 + MCP JSON-RPC 2.0）
  * 运行要求: Node.js v20+
  *
  * 推荐启动方式（单命令同时启动本地桥接 + 公网隧道，自动打印一键配对串）:
@@ -12,13 +12,14 @@ export function getLocalBridgeScript(): string {
  *   node local-bridge.mjs setup
  *
  * 其他参数:
- *   --root <dir>     限定可访问的根目录（默认当前目录）
- *   --port <num>     本机监听端口（默认 4829，严格绑定 127.0.0.1）
- *   --token <str>    固定访问令牌（默认每次启动随机生成 48 位密钥）
- *   --ngrok          自动拉起 ngrok http <port> 并输出一键配对串
- *   --cloudflared    自动拉起 cloudflared 快速隧道并输出一键配对串
- *   --read-only      硬只读模式（物理禁止写入、删除、改名与命令）
- *   --no-shell       禁用终端命令执行（仅允许文件读写与只读 Git）
+ *   --root <dir>      限定可访问的根目录（默认当前目录）
+ *   --port <num>      本机监听端口（默认 4829，严格绑定 127.0.0.1）
+ *   --token <str>     固定访问令牌（默认每次启动随机生成 48 位密钥）
+ *   --ngrok           自动拉起 ngrok http <port> 并输出一键配对串
+ *   --cloudflared     自动拉起 cloudflared 快速隧道并输出一键配对串
+ *   --read-only       硬只读模式（物理禁止写入、删除、改名与命令）
+ *   --no-shell        禁用终端命令执行（仅允许文件读写与只读 Git）
+ *   --allow-secrets   关闭默认敏感文件拦截（默认禁止读取 .env / 私钥 / *.pem / *.key）
  */
 
 import http from 'node:http';
@@ -30,7 +31,7 @@ import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { spawn, execFileSync } from 'node:child_process';
 
-const VERSION = '2.0.0';
+const VERSION = '2.2.0';
 
 function parseArgs(argv) {
   const args = {
@@ -41,6 +42,7 @@ function parseArgs(argv) {
     tunnel: '',
     noShell: false,
     readOnly: false,
+    allowSecrets: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -54,6 +56,7 @@ function parseArgs(argv) {
     else if (a === '--tunnel' && argv[i + 1]) args.tunnel = String(argv[++i]).toLowerCase();
     else if (a === '--no-shell') args.noShell = true;
     else if (a === '--read-only') args.readOnly = true;
+    else if (a === '--allow-secrets') args.allowSecrets = true;
     else if (a === '--help' || a === '-h') args.help = true;
   }
   return args;
@@ -70,13 +73,14 @@ if (CLI.help) {
   node local-bridge.mjs [选项]                         仅启动本机 127.0.0.1 服务
 
 选项:
-  --root <dir>     限定可访问的根目录（默认当前目录）
-  --port <num>     监听端口（默认 4829，严格绑定 127.0.0.1）
-  --token <str>    固定访问 Token（默认每次随机生成）
-  --ngrok          自动启动 ngrok 并读取公网地址
-  --cloudflared    自动启动 cloudflared 临时隧道
-  --read-only      只读模式（物理禁止写入、删除、改名与命令）
-  --no-shell       禁用 run_command（保留文件读写与只读 Git）
+  --root <dir>      限定可访问的根目录（默认当前目录）
+  --port <num>      监听端口（默认 4829，严格绑定 127.0.0.1）
+  --token <str>     固定访问 Token（默认每次随机生成）
+  --ngrok           自动启动 ngrok 并读取公网地址
+  --cloudflared     自动启动 cloudflared 临时隧道
+  --read-only       只读模式（物理禁止写入、删除、改名与命令）
+  --no-shell        禁用 run_command（保留文件读写与只读 Git）
+  --allow-secrets   关闭默认敏感文件拦截（不推荐）
 \`);
   process.exit(0);
 }
@@ -129,6 +133,36 @@ const IGNORED_DIRS = new Set([
   '.idea', '.vs', 'out',
 ]);
 
+const SAFE_ENV_EXAMPLES = new Set([
+  '.env.example',
+  '.env.sample',
+  '.env.template',
+  '.env.dist',
+]);
+
+const SENSITIVE_BASENAMES = new Set([
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+  '.npmrc',
+  '.netrc',
+  '.pypirc',
+  'credentials.json',
+  'secrets.json',
+  'secrets.yaml',
+  'secrets.yml',
+]);
+
+const SENSITIVE_EXTENSIONS = new Set([
+  '.pem',
+  '.key',
+  '.p12',
+  '.pfx',
+  '.jks',
+  '.keystore',
+]);
+
 const MAX_READ_BYTES = 1024 * 1024 * 2;
 const activeProcesses = new Map();
 let ROOT_REAL = '';
@@ -136,10 +170,37 @@ let ACTIVE_TOKEN = '';
 let ACTIVE_PORT = 4829;
 let ACTIVE_NO_SHELL = false;
 let ACTIVE_READ_ONLY = false;
+let ACTIVE_ALLOW_SECRETS = false;
 let tunnelChild = null;
 
 function toPosix(p) {
   return p.split(path.sep).join('/');
+}
+
+function isSensitiveRelPath(relPosix) {
+  if (ACTIVE_ALLOW_SECRETS) return false;
+  const normalized = String(relPosix || '').replace(/^\\/+/, '').toLowerCase();
+  if (!normalized || normalized === '.') return false;
+  const parts = normalized.split('/');
+  const base = parts[parts.length - 1];
+  if (parts.includes('.ssh') || parts.includes('.aws') || parts.includes('.gnupg')) {
+    return true;
+  }
+  if (base === '.env' || (base.startsWith('.env.') && !SAFE_ENV_EXAMPLES.has(base))) {
+    return true;
+  }
+  if (SENSITIVE_BASENAMES.has(base)) return true;
+  if (base.startsWith('service-account') && base.endsWith('.json')) return true;
+  const ext = path.posix.extname(base);
+  if (SENSITIVE_EXTENSIONS.has(ext)) return true;
+  return false;
+}
+
+function assertNotSensitive(absPath) {
+  const rel = toPosix(path.relative(ROOT_REAL, absPath));
+  if (isSensitiveRelPath(rel)) {
+    throw new Error(\`敏感文件保护：已拦截对 "\${rel}" 的访问（如需临时放行请使用 --allow-secrets 启动）\`);
+  }
 }
 
 async function resolveSafePath(relPath = '.', { allowNonExistent = false } = {}) {
@@ -276,6 +337,17 @@ function assertWritable(toolName) {
   }
 }
 
+function terminateChildTree(child) {
+  if (!child || child.killed) return;
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      return;
+    } catch {}
+  }
+  try { child.kill('SIGTERM'); } catch {}
+}
+
 const TOOL_SCHEMAS = [
   {
     name: 'inspect_workspace',
@@ -370,7 +442,6 @@ const TOOL_SCHEMAS = [
         ref: { type: 'string' },
         limit: { type: 'number' },
       },
-      required: ['action'],
     },
   },
   {
@@ -380,7 +451,7 @@ const TOOL_SCHEMAS = [
   },
   {
     name: 'edit_file',
-    description: '精准替换文件中的片段（支持单次替换或 edits 数组原子多处替换）',
+    description: '精准替换文件中的片段（支持单次替换或 edits 数组原子多处替换，自动兼容 CRLF/LF）',
     inputSchema: {
       type: 'object',
       properties: {
@@ -414,6 +485,27 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'write_files',
+    description: '一次请求批量原子写入多个文件（任一失败自动回滚已写文件）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              content: { type: 'string' },
+            },
+            required: ['path', 'content'],
+          },
+        },
+      },
+      required: ['files'],
+    },
+  },
+  {
     name: 'delete_file',
     description: '删除工作区内的指定文件',
     inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
@@ -434,7 +526,7 @@ const TOOL_SCHEMAS = [
   },
   {
     name: 'run_command',
-    description: '在工作区或子目录中执行本机终端命令',
+    description: '在工作区或子目录中执行本机终端命令（支持流式输出与随时终止，最长 600s）',
     inputSchema: {
       type: 'object',
       properties: {
@@ -450,6 +542,7 @@ const TOOL_SCHEMAS = [
 
 async function readSingleFile(relPath, startLineArg = 1, endLineArg = 300) {
   const abs = await resolveSafePath(relPath);
+  assertNotSensitive(abs);
   const stat = await fs.stat(abs);
   if (stat.isDirectory()) throw new Error(\`路径是目录而非文件: \${relPath}\`);
   if (stat.size > MAX_READ_BYTES) {
@@ -468,6 +561,73 @@ async function readSingleFile(relPath, startLineArg = 1, endLineArg = 300) {
     truncated: end < totalLines,
     content: lines.slice(start - 1, end).join('\\n'),
   };
+}
+
+async function executeCommand(args = {}, hooks = {}) {
+  assertWritable('run_command');
+  if (ACTIVE_NO_SHELL) throw new Error('LocalBridge 已启用 --no-shell 模式，禁止执行终端命令');
+  const command = String(args.command || '').trim();
+  if (!command) throw new Error('command 不能为空');
+  const cwdAbs = await resolveSafePath(args.cwd || '.');
+  const timeoutMs = Math.min(600000, Math.max(2000, Number(args.timeoutMs || 90000)));
+  const processId = String(args.processId || crypto.randomUUID());
+
+  return await new Promise((resolve) => {
+    const startedAt = Date.now();
+    const child = spawn(command, {
+      cwd: cwdAbs,
+      shell: true,
+      env: { ...process.env, CI: process.env.CI || 'true' },
+    });
+    activeProcesses.set(processId, child);
+    hooks.onStart?.(processId);
+
+    let stdout = '';
+    let stderr = '';
+    let killedByTimeout = false;
+
+    const timer = setTimeout(() => {
+      killedByTimeout = true;
+      terminateChildTree(child);
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      if (stdout.length < 160000) stdout += text;
+      hooks.onStdout?.(text);
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      if (stderr.length < 160000) stderr += text;
+      hooks.onStderr?.(text);
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      activeProcesses.delete(processId);
+      resolve({
+        processId,
+        exitCode: -1,
+        stdout,
+        stderr: err.message,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      activeProcesses.delete(processId);
+      resolve({
+        processId,
+        exitCode: typeof code === 'number' ? code : -1,
+        stdout,
+        stderr: killedByTimeout
+          ? \`\${stderr}\\n[LocalBridge] 命令执行超时 (\${timeoutMs}ms) 已自动终止\`
+          : stderr,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+  });
 }
 
 async function handleTool(tool, args = {}) {
@@ -516,6 +676,7 @@ async function handleTool(tool, args = {}) {
         path: relPrefix || '.',
         noShell: ACTIVE_NO_SHELL,
         readOnly: ACTIVE_READ_ONLY,
+        allowSecrets: ACTIVE_ALLOW_SECRETS,
         branch: rootGit?.branch,
         dirtyCount: rootGit?.dirtyCount,
         gitRepos,
@@ -571,6 +732,7 @@ async function handleTool(tool, args = {}) {
           } else {
             const full = path.join(dir, e.name);
             const rel = toPosix(path.relative(ROOT_REAL, full));
+            if (isSensitiveRelPath(rel)) continue;
             if (extSet && !extSet.has(path.extname(e.name).toLowerCase())) continue;
             if (patternRe && !patternRe.test(rel) && !(patternBaseRe && patternBaseRe.test(e.name))) continue;
             files.push(rel);
@@ -614,9 +776,7 @@ async function handleTool(tool, args = {}) {
       const caseSensitive = Boolean(args.caseSensitive);
       const contextLines = Math.min(4, Math.max(0, Number(args.contextLines || 0)));
 
-      const matcher = useRegex
-        ? new RegExp(query, caseSensitive ? '' : 'i')
-        : null;
+      const matcher = useRegex ? new RegExp(query, caseSensitive ? '' : 'i') : null;
       const needle = caseSensitive ? query : query.toLowerCase();
 
       const matches = [];
@@ -632,6 +792,7 @@ async function handleTool(tool, args = {}) {
             await walk(full);
           } else {
             const rel = toPosix(path.relative(ROOT_REAL, full));
+            if (isSensitiveRelPath(rel)) continue;
             if (!matchesIncludeFilter(rel, include)) continue;
             try {
               const stat = await fs.stat(full);
@@ -668,9 +829,19 @@ async function handleTool(tool, args = {}) {
     }
 
     case 'git_inspect': {
-      const cwdAbs = await resolveSafePath(args.cwd || '.');
+      let rawCwd = typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : '';
+      let targetPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
+      if (!rawCwd && targetPath) {
+        try {
+          const maybeRepo = await resolveSafePath(targetPath);
+          if (fsSync.existsSync(path.join(maybeRepo, '.git'))) {
+            rawCwd = targetPath;
+            targetPath = '';
+          }
+        } catch {}
+      }
+      const cwdAbs = await resolveSafePath(rawCwd || '.');
       const action = String(args.action || 'status');
-      const targetPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
       const ref = typeof args.ref === 'string' && args.ref.trim() ? args.ref.trim() : '';
       const limit = Math.min(50, Math.max(1, Number(args.limit || 15)));
 
@@ -724,9 +895,19 @@ async function handleTool(tool, args = {}) {
     }
 
     case 'git_diff': {
-      const cwdAbs = await resolveSafePath(args.cwd || '.');
+      let rawCwd = typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : '';
+      let targetPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
+      if (!rawCwd && targetPath) {
+        try {
+          const maybeRepo = await resolveSafePath(targetPath);
+          if (fsSync.existsSync(path.join(maybeRepo, '.git'))) {
+            rawCwd = targetPath;
+            targetPath = '';
+          }
+        } catch {}
+      }
+      const cwdAbs = await resolveSafePath(rawCwd || '.');
       const cwdRel = toPosix(path.relative(ROOT_REAL, cwdAbs)) || '.';
-      const targetPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
       try {
         const status = runGitSafe(cwdAbs, ['status', '--short', '--branch']).trim();
         const diffArgs = ['diff', '--no-color'];
@@ -741,20 +922,41 @@ async function handleTool(tool, args = {}) {
     case 'edit_file': {
       assertWritable('edit_file');
       const abs = await resolveSafePath(args.path);
+      assertNotSensitive(abs);
       const original = await fs.readFile(abs, 'utf8');
       const editList = Array.isArray(args.edits) && args.edits.length > 0
         ? args.edits
         : [{ oldText: args.oldText, newText: args.newText, replaceAll: args.replaceAll }];
 
+      const fileUsesCrlf = original.includes('\\r\\n');
       let updated = original;
       let appliedCount = 0;
       for (let i = 0; i < editList.length; i++) {
         const item = editList[i];
-        const oldText = String(item.oldText ?? '');
-        const newText = String(item.newText ?? '');
+        let oldText = String(item.oldText ?? '');
+        let newText = String(item.newText ?? '');
         const replaceAll = Boolean(item.replaceAll);
         if (!oldText) throw new Error(\`第 \${i + 1} 项编辑缺少 oldText\`);
-        const firstIdx = updated.indexOf(oldText);
+        let firstIdx = updated.indexOf(oldText);
+        if (firstIdx === -1) {
+          if (fileUsesCrlf && !oldText.includes('\\r\\n') && oldText.includes('\\n')) {
+            const crlfOld = oldText.replace(/\\n/g, '\\r\\n');
+            const crlfIdx = updated.indexOf(crlfOld);
+            if (crlfIdx !== -1) {
+              oldText = crlfOld;
+              newText = newText.replace(/\\r?\\n/g, '\\r\\n');
+              firstIdx = crlfIdx;
+            }
+          } else if (!fileUsesCrlf && oldText.includes('\\r\\n')) {
+            const lfOld = oldText.replace(/\\r\\n/g, '\\n');
+            const lfIdx = updated.indexOf(lfOld);
+            if (lfIdx !== -1) {
+              oldText = lfOld;
+              newText = newText.replace(/\\r\\n/g, '\\n');
+              firstIdx = lfIdx;
+            }
+          }
+        }
         if (firstIdx === -1) {
           throw new Error(\`第 \${i + 1} 项未找到匹配的 oldText 片段，请先 read_file 确认最新内容。\`);
         }
@@ -766,17 +968,32 @@ async function handleTool(tool, args = {}) {
       }
 
       await fs.writeFile(abs, updated, 'utf8');
+      const canSnap = Buffer.byteLength(original, 'utf8') <= MAX_READ_BYTES;
       return {
         path: toPosix(path.relative(ROOT_REAL, abs)),
         appliedEdits: appliedCount,
         bytesWritten: Buffer.byteLength(updated, 'utf8'),
         lineCount: updated.split(/\\r?\\n/).length,
+        existed: true,
+        previousContent: canSnap ? original : undefined,
       };
     }
 
     case 'write_file': {
       assertWritable('write_file');
       const abs = await resolveSafePath(args.path, { allowNonExistent: true });
+      assertNotSensitive(abs);
+      let existed = false;
+      let previousContent = undefined;
+      try {
+        const st = await fs.stat(abs);
+        if (st.isFile()) {
+          existed = true;
+          if (st.size <= MAX_READ_BYTES) {
+            previousContent = await fs.readFile(abs, 'utf8');
+          }
+        }
+      } catch {}
       const content = String(args.content ?? '');
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, content, 'utf8');
@@ -784,16 +1001,94 @@ async function handleTool(tool, args = {}) {
         path: toPosix(path.relative(ROOT_REAL, abs)),
         bytesWritten: Buffer.byteLength(content, 'utf8'),
         lineCount: content.split(/\\r?\\n/).length,
+        existed,
+        previousContent,
+      };
+    }
+
+    case 'write_files': {
+      assertWritable('write_files');
+      const items = Array.isArray(args.files) ? args.files : [];
+      if (items.length === 0) throw new Error('write_files 需要非空的 files 数组');
+      if (items.length > 20) throw new Error('write_files 单次最多写入 20 个文件');
+
+      const prepared = [];
+      for (const item of items) {
+        const abs = await resolveSafePath(item.path, { allowNonExistent: true });
+        assertNotSensitive(abs);
+        let existed = false;
+        let previousBuffer = null;
+        let previousText = undefined;
+        try {
+          const st = await fs.stat(abs);
+          if (st.isDirectory()) throw new Error(\`目标是目录而非文件: \${item.path}\`);
+          existed = true;
+          previousBuffer = await fs.readFile(abs);
+          if (st.size <= MAX_READ_BYTES) {
+            previousText = previousBuffer.toString('utf8');
+          }
+        } catch (err) {
+          if (err && err.code !== 'ENOENT') throw err;
+        }
+        prepared.push({
+          abs,
+          rel: toPosix(path.relative(ROOT_REAL, abs)),
+          content: String(item.content ?? ''),
+          existed,
+          previousBuffer,
+          previousText,
+        });
+      }
+
+      const applied = [];
+      try {
+        for (const p of prepared) {
+          await fs.mkdir(path.dirname(p.abs), { recursive: true });
+          await fs.writeFile(p.abs, p.content, 'utf8');
+          applied.push(p);
+        }
+      } catch (err) {
+        for (const p of applied.reverse()) {
+          try {
+            if (p.existed && p.previousBuffer) {
+              await fs.writeFile(p.abs, p.previousBuffer);
+            } else if (!p.existed) {
+              await fs.unlink(p.abs);
+            }
+          } catch {}
+        }
+        throw err;
+      }
+
+      return {
+        count: prepared.length,
+        files: prepared.map((p) => ({
+          path: p.rel,
+          bytesWritten: Buffer.byteLength(p.content, 'utf8'),
+          lineCount: p.content.split(/\\r?\\n/).length,
+        })),
+        previousFiles: prepared.map((p) => ({
+          filePath: p.rel,
+          existed: p.existed,
+          content: p.previousText,
+        })),
       };
     }
 
     case 'delete_file': {
       assertWritable('delete_file');
       const abs = await resolveSafePath(args.path);
+      assertNotSensitive(abs);
       const stat = await fs.stat(abs);
       if (stat.isDirectory()) throw new Error('安全策略：禁止通过 delete_file 删除目录');
+      const previousContent = stat.size <= MAX_READ_BYTES ? await fs.readFile(abs, 'utf8') : undefined;
       await fs.unlink(abs);
-      return { path: toPosix(path.relative(ROOT_REAL, abs)), deleted: true };
+      return {
+        path: toPosix(path.relative(ROOT_REAL, abs)),
+        deleted: true,
+        existed: true,
+        previousContent,
+      };
     }
 
     case 'create_directory': {
@@ -807,6 +1102,8 @@ async function handleTool(tool, args = {}) {
       assertWritable('move_path');
       const fromAbs = await resolveSafePath(args.from);
       const toAbs = await resolveSafePath(args.to, { allowNonExistent: true });
+      assertNotSensitive(fromAbs);
+      assertNotSensitive(toAbs);
       if (fromAbs === ROOT_REAL || toAbs === ROOT_REAL) {
         throw new Error('禁止移动工作区根目录本身');
       }
@@ -820,63 +1117,7 @@ async function handleTool(tool, args = {}) {
     }
 
     case 'run_command': {
-      assertWritable('run_command');
-      if (ACTIVE_NO_SHELL) throw new Error('LocalBridge 已启用 --no-shell 模式，禁止执行终端命令');
-      const command = String(args.command || '').trim();
-      if (!command) throw new Error('command 不能为空');
-      const cwdAbs = await resolveSafePath(args.cwd || '.');
-      const timeoutMs = Math.min(180000, Math.max(2000, Number(args.timeoutMs || 60000)));
-      const processId = String(args.processId || crypto.randomUUID());
-
-      return await new Promise((resolve) => {
-        const startedAt = Date.now();
-        const child = spawn(command, {
-          cwd: cwdAbs,
-          shell: true,
-          env: process.env,
-        });
-        activeProcesses.set(processId, child);
-
-        let stdout = '';
-        let stderr = '';
-        let killedByTimeout = false;
-
-        const timer = setTimeout(() => {
-          killedByTimeout = true;
-          try { child.kill('SIGTERM'); } catch {}
-        }, timeoutMs);
-
-        child.stdout.on('data', (chunk) => {
-          if (stdout.length < 120000) stdout += chunk.toString('utf8');
-        });
-        child.stderr.on('data', (chunk) => {
-          if (stderr.length < 120000) stderr += chunk.toString('utf8');
-        });
-
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          activeProcesses.delete(processId);
-          resolve({
-            processId,
-            exitCode: -1,
-            stdout,
-            stderr: err.message,
-            durationMs: Date.now() - startedAt,
-          });
-        });
-
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          activeProcesses.delete(processId);
-          resolve({
-            processId,
-            exitCode: typeof code === 'number' ? code : -1,
-            stdout,
-            stderr: killedByTimeout ? \`\${stderr}\\n[LocalBridge] 命令执行超时 (\${timeoutMs}ms) 已自动终止\` : stderr,
-            durationMs: Date.now() - startedAt,
-          });
-        });
-      });
+      return await executeCommand(args);
     }
 
     default:
@@ -916,12 +1157,19 @@ function readJsonBody(req) {
   });
 }
 
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 function isAuthorized(req, urlObj) {
   const headerToken = req.headers['x-bridge-token'];
   const authHeader = String(req.headers['authorization'] || '');
   const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
   const pathToken = urlObj.pathname.startsWith('/mcp/') ? decodeURIComponent(urlObj.pathname.slice(5)) : '';
-  return headerToken === ACTIVE_TOKEN || bearer === ACTIVE_TOKEN || pathToken === ACTIVE_TOKEN;
+  return safeEqual(headerToken, ACTIVE_TOKEN) || safeEqual(bearer, ACTIVE_TOKEN) || safeEqual(pathToken, ACTIVE_TOKEN);
 }
 
 async function handleMcpJsonRpc(body) {
@@ -996,6 +1244,7 @@ function createServer() {
         rootPath: ROOT_REAL,
         noShell: ACTIVE_NO_SHELL,
         readOnly: ACTIVE_READ_ONLY,
+        allowSecrets: ACTIVE_ALLOW_SECRETS,
       });
       return;
     }
@@ -1020,6 +1269,43 @@ function createServer() {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/api/tool-stream') {
+      try {
+        const body = await readJsonBody(req);
+        if (body.tool !== 'run_command') {
+          const result = await handleTool(body.tool, body.args || {});
+          sendJson(res, 200, { ok: true, result });
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'X-Accel-Buffering': 'no',
+        });
+        const emit = (obj) => {
+          if (!res.writableEnded) {
+            try { res.write(JSON.stringify(obj) + '\\n'); } catch {}
+          }
+        };
+        const result = await executeCommand(body.args || {}, {
+          onStart: (processId) => emit({ type: 'start', processId }),
+          onStdout: (chunk) => emit({ type: 'stdout', chunk }),
+          onStderr: (chunk) => emit({ type: 'stderr', chunk }),
+        });
+        emit({ type: 'done', ok: true, result });
+        res.end();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!res.headersSent) {
+          sendJson(res, 400, { ok: false, error: msg });
+        } else {
+          try { res.write(JSON.stringify({ type: 'error', error: msg }) + '\\n'); } catch {}
+          res.end();
+        }
+      }
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/api/tool') {
       try {
         const body = await readJsonBody(req);
@@ -1034,10 +1320,11 @@ function createServer() {
     if (req.method === 'POST' && pathname === '/api/kill') {
       try {
         const body = await readJsonBody(req);
-        const child = activeProcesses.get(String(body.processId || ''));
+        const pid = String(body.processId || '');
+        const child = activeProcesses.get(pid);
         if (child) {
-          try { child.kill('SIGTERM'); } catch {}
-          activeProcesses.delete(String(body.processId || ''));
+          terminateChildTree(child);
+          activeProcesses.delete(pid);
           sendJson(res, 200, { ok: true, killed: true });
         } else {
           sendJson(res, 200, { ok: true, killed: false });
@@ -1128,11 +1415,11 @@ function printPairingBanner(publicUrl) {
 
 function cleanupAndExit() {
   if (tunnelChild) {
-    try { tunnelChild.kill('SIGTERM'); } catch {}
+    terminateChildTree(tunnelChild);
     tunnelChild = null;
   }
   for (const child of activeProcesses.values()) {
-    try { child.kill('SIGTERM'); } catch {}
+    terminateChildTree(child);
   }
   process.exit(0);
 }
@@ -1148,6 +1435,7 @@ async function main() {
   ACTIVE_TOKEN = cfg.token || crypto.randomBytes(24).toString('hex');
   ACTIVE_NO_SHELL = Boolean(cfg.noShell || cfg.readOnly);
   ACTIVE_READ_ONLY = Boolean(cfg.readOnly);
+  ACTIVE_ALLOW_SECRETS = Boolean(cfg.allowSecrets);
 
   const server = createServer();
   server.listen(ACTIVE_PORT, '127.0.0.1', async () => {
@@ -1155,13 +1443,14 @@ async function main() {
       ? '硬只读（禁写禁命令）'
       : ACTIVE_NO_SHELL
         ? '仅文件读写（禁 Shell）'
-        : '完整模式（读写 + Git + 终端）';
+        : '完整模式（读写 + Git + 流式终端）';
 
     console.log('');
     console.log(\`LocalBridge v\${VERSION} 已在本地启动（仅监听 127.0.0.1）\`);
     console.log('------------------------------------------------------------');
     console.log(\`工作区目录 : \${ROOT_REAL}\`);
     console.log(\`权限模式   : \${modeLabel}\`);
+    console.log(\`敏感文件保护: \${ACTIVE_ALLOW_SECRETS ? '已关闭 (--allow-secrets)' : '已开启（自动拦截 .env / 私钥 / *.pem）'}\`);
     console.log(\`本机地址   : http://127.0.0.1:\${ACTIVE_PORT}\`);
     console.log(\`安全 Token : \${ACTIVE_TOKEN}\`);
     console.log('------------------------------------------------------------');
