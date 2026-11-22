@@ -1192,8 +1192,20 @@ async function startServer() {
   if (!isProduction) {
     process.env.DISABLE_HMR = 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
+      server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
+    });
+    // Prevent 1-year `immutable` disk cache entries from poisoning embedded iframe reloads
+    // if a dev server restart interrupts an in-flight Vite pre-bundled dep transfer.
+    app.use('/node_modules/.vite/deps', (_req, res, next) => {
+      const origSetHeader = res.setHeader.bind(res);
+      res.setHeader = ((name: string, value: number | string | readonly string[]) => {
+        if (name.toLowerCase() === 'cache-control') {
+          return origSetHeader(name, 'no-cache');
+        }
+        return origSetHeader(name, value);
+      }) as typeof res.setHeader;
+      next();
     });
     app.use(vite.middlewares);
   } else {

@@ -31,6 +31,12 @@ export default defineConfig(() => {
         },
       },
     ],
+    define: {
+      __LOCALBRIDGE_DEP_EPOCH__: JSON.stringify('v2.2.1'),
+    },
+    optimizeDeps: {
+      include: ['react', 'react-dom', 'react-dom/client', 'lucide-react'],
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

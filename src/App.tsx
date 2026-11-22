@@ -29,6 +29,22 @@ function updateTreeChildren(nodes: FileNode[], targetPath: string, children: Fil
   });
 }
 
+function safeGetLocalStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetLocalStorage(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore cross-site iframe storage restrictions
+  }
+}
+
 function readCachedSession(): { tunnelUrl: string; token: string } | null {
   try {
     const raw = sessionStorage.getItem(SESSION_KEY);
@@ -69,14 +85,14 @@ function playGentleApprovalChime() {
 
 export function App() {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
-    const saved = localStorage.getItem('localbridge.theme');
+    const saved = safeGetLocalStorage('localbridge.theme');
     if (saved === 'light') return false;
     if (saved === 'dark') return true;
     return true;
   });
 
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
-    return localStorage.getItem('localbridge.sound') === 'on';
+    return safeGetLocalStorage('localbridge.sound') === 'on';
   });
 
   const [activeView, setActiveView] = useState<MainView>('companion');
@@ -126,11 +142,11 @@ export function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
-    localStorage.setItem('localbridge.theme', darkMode ? 'dark' : 'light');
+    safeSetLocalStorage('localbridge.theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
   useEffect(() => {
-    localStorage.setItem('localbridge.sound', soundEnabled ? 'on' : 'off');
+    safeSetLocalStorage('localbridge.sound', soundEnabled ? 'on' : 'off');
   }, [soundEnabled]);
 
   // Browser tab title notification + optional chime for new pending approvals
