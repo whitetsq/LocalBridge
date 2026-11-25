@@ -613,15 +613,34 @@ export function CompanionPanel({
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={pinging}
-                    onClick={onPingHealth}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300/70 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-xs text-slate-700 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <RefreshCw className={`w-3 h-3 ${pinging ? 'animate-spin' : ''}`} />
-                    <span>探活</span>
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleDownloadScript}
+                      title="下载最新 local-bridge.mjs v2.2.0 脚本"
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                        state.workspace?.version && state.workspace.version !== '2.2.0'
+                          ? 'bg-blue-600 text-white hover:bg-blue-700'
+                          : 'border border-slate-300/70 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800'
+                      }`}
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>
+                        {state.workspace?.version && state.workspace.version !== '2.2.0'
+                          ? '升级 v2.2 脚本'
+                          : '下载 v2.2 脚本'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pinging}
+                      onClick={onPingHealth}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-300/70 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-xs text-slate-700 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${pinging ? 'animate-spin' : ''}`} />
+                      <span>探活</span>
+                    </button>
+                  </div>
                 </div>
 
                 {state.workspace?.gitRepos && state.workspace.gitRepos.length > 0 && (

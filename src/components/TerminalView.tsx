@@ -325,10 +325,10 @@ export function TerminalView({
           <div className="p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] space-y-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-950 dark:text-white">
-                本机脚本 local-bridge.mjs v2.1
+                本机脚本 local-bridge.mjs v2.2
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                零依赖 Node.js v20+ 单文件：支持 <code className="font-mono">--ngrok</code> / <code className="font-mono">--cloudflared</code> 一键配对、NDJSON 实时流式终端、敏感文件硬隔离（默认拦截 <code className="font-mono">.env</code> / 私钥）、多仓库 <code className="font-mono">git_inspect</code> 与进程树终止。
+                零依赖 Node.js v20+ 单文件：支持 <code className="font-mono">--ngrok</code> / <code className="font-mono">--cloudflared</code> 一键配对、CRLF 自适应编辑、批量原子写、子仓库 Git 自动识别与 10 分钟命令超时。
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -338,7 +338,7 @@ export function TerminalView({
                 className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition-colors whitespace-nowrap cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>下载 v2.1 脚本</span>
+                <span>下载 v2.2 脚本</span>
               </button>
               <button
                 type="button"
